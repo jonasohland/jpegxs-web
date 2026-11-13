@@ -38,7 +38,7 @@ interface Case {
   nativeArgs: string[];
 }
 
-// Same configurations as spike/compare.sh.
+// Same configurations as scripts/compare-apps.sh (cases a-d, g).
 const CASES: Case[] = [
   { name: "a", width: 1920, height: 1080, format: "yuv420", depth: 8, options: { bpp: 3 }, nativeArgs: ["--bpp", "3"] },
   { name: "b", width: 1280, height: 720, format: "yuv422", depth: 10, options: { bpp: 4 }, nativeArgs: ["--bpp", "4"] },
@@ -59,6 +59,16 @@ const CASES: Case[] = [
     depth: 10,
     options: { bpp: 2.5, rateControl: 3, decompV: 1, decompH: 3 },
     nativeArgs: ["--bpp", "2.5", "--rc", "3", "--decomp_v", "1", "--decomp_h", "3"],
+  },
+  {
+    // Uniform quantization; odd sizes exercise the kernels' partial groups.
+    name: "e",
+    width: 1918,
+    height: 1078,
+    format: "yuv444",
+    depth: 12,
+    options: { bpp: 5, quantization: "uniform", decompV: 1 },
+    nativeArgs: ["--bpp", "5", "--quantization", "1", "--decomp_v", "1"],
   },
 ];
 

@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Bit-exactness check of the wasm apps against the native reference apps.
 # Encodes synthetic frames with the native SVT apps (SIMD and --asm c) and the
-# wasm build (under node), decodes with native and wasm, and compares outputs.
+# wasm build (under node), decodes with native and wasm (wasm SIMD kernels and
+# --asm c), and compares outputs.
 # Exits non-zero on any mismatch.
 #
 # Usage: scripts/compare-apps.sh <native-bin-dir> <wasm-bin-dir> <work-dir>
@@ -61,9 +62,11 @@ run_case() { # run_case <name> <w> <h> <fmt> <depth> <bpp> [extra enc args]
   wasm SvtJpegxsEncApp -i "$name.yuv" -b "$name.wasm.jxs" "${enc[@]}" >/dev/null
   native SvtJpegxsDecApp -i "$name.native.jxs" -o "$name.native.dec.yuv" -v 0 >/dev/null
   wasm SvtJpegxsDecApp -i "$name.native.jxs" -o "$name.wasm.dec.yuv" -v 0 >/dev/null
+  wasm SvtJpegxsDecApp -i "$name.native.jxs" -o "$name.wasm-c.dec.yuv" --asm c -v 0 >/dev/null
   check "$name.native.jxs" "$name.native-c.jxs" "enc: native C == native SIMD"
   check "$name.native.jxs" "$name.wasm.jxs" "enc: wasm == native"
   check "$name.native.dec.yuv" "$name.wasm.dec.yuv" "dec: wasm == native"
+  check "$name.native.dec.yuv" "$name.wasm-c.dec.yuv" "dec: wasm C == native"
 }
 
 run_case a 1920 1080 yuv420 8 3
@@ -71,6 +74,8 @@ run_case b 1280 720 yuv422 10 4
 run_case c 640 480 yuv444 12 6 --coding-signs 2 --coding-vpred 1
 run_case d 1000 600 yuv422 10 2.5 --rc 3 --decomp_v 1 --decomp_h 3
 run_case e 1000 600 yuv422 10 3 --lp 8
+run_case f 1000 600 yuv422 10 3 --quantization 1
+run_case g 1918 1078 yuv444 12 5 --quantization 1 --decomp_v 1
 
 if [ "$failures" -ne 0 ]; then
   echo "$failures comparison(s) failed"

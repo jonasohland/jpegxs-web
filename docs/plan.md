@@ -76,11 +76,44 @@ In `github.com/jonasohland/SVT-JPEG-XS`:
 Measured against the plain-C baseline:
 
 1. `-O3 -msimd128` + LTO. — done
-2. Try compiling the existing SSE2/SSE4.1 kernels via emscripten's SSE →
-   wasm SIMD translation (AVX2/AVX-512 don't map well).
+2. ~~Try compiling the existing SSE2/SSE4.1 kernels via emscripten's SSE →
+   wasm SIMD translation.~~ Dropped: the decoder has a single SSE kernel
+   (`dequant`), now written by hand.
 3. Hand-written `wasm_simd128.h` kernels for profiled hotspots (likely
-   I/DWT, NLT, (de)quantization, (un)packing) as an `ARCH_WASM` entry in the
-   rtcd dispatch, keeping C as the reference.
+   I/DWT, NLT, (de)quantization, (un)packing) as a `CPU_FLAGS_WASM_SIMD128`
+   entry in the rtcd dispatch, keeping C as the reference. — in progress
+   (`dequant` done)
+
+### Phase 5 — Single-threaded fallback for non-isolated pages (investigation)
+
+After the performance work. The pthreads build needs `SharedArrayBuffer`, so
+it only runs on cross-origin isolated pages (COOP/COEP). Investigate a second
+build without `-pthread` that the JS side picks when `crossOriginIsolated` is
+false. Decoder first; the encoder only if it comes cheaply.
+
+Questions to answer:
+
+- **How to run the pipeline without threads.** Upstream has no
+  single-threaded path: the init → universal → final stage threads talk through
+  FIFOs and condition variables. Options:
+  - drive the stage functions inline from the shim, slice by slice (parse
+    header, `svt_jpeg_xs_decode_slice` per slice in order, then the final
+    slice-overlap/IDWT step), bypassing the threads and FIFOs;
+  - a build-time switch in the fork that replaces `SVT_CREATE_THREAD` and the
+    blocking FIFO calls with inline execution;
+  - a refactor of `DecHandle.c` and the stage files (largest, most invasive).
+  Check how much of this upstream would accept, so the fork stays rebaseable.
+- **Bit-exactness.** The output must match the threaded build and the native
+  apps. Add the non-threaded build to `npm test` and the Nix checks.
+- **Cost.** Expected speed is roughly the one-worker numbers (`threads: 3`
+  in the Phase 4 table), minus the hand-off overhead. Measure it, and the
+  extra download size of a second `jxs.wasm`.
+- **Packaging and API.** Two wasm/glue pairs in `dist/`, chosen at runtime in
+  `createJxsWorker()` / `JxsCodec.create()`, behind the same API. The fallback
+  still runs in a Worker so the main thread doesn't block. Without
+  `SharedArrayBuffer`, results can still be transferred.
+- **Phase 4 carry-over.** The Liftoff issue (endless loops entered once) may
+  look different without threads; re-check that the hot code tiers up.
 
 ## Open decision
 
@@ -88,7 +121,7 @@ Measured against the plain-C baseline:
 changes but requires cross-origin isolation for every embedding page.
 Supporting non-isolated pages requires a second build that runs the stage
 kernels inline (a real refactor of `DecHandle.c` / `EncHandle.c` and the stage
-files).
+files). To be investigated in Phase 5.
 
 ## Phase 0 results (2026-11-13)
 
@@ -426,23 +459,65 @@ With both fixes, the wasm decoder at the default `threads: 8` is 2.1–2.6×
 faster than the current build and within 10–20% of native C. It is still 3×
 slower than native AVX2/AVX-512.
 
-Both fixes are uncommitted changes in the submodule (`Dequant.c`,
-`DecThreadSlice.c`). `npm test` (bit-exact vs native), `test:browser` and
+Both fixes are in the fork as commit `10a93c0`. `npm test` (bit-exact vs native), `test:browser` and
 `nix flake check` pass with them.
+
+### Step 3: wasm SIMD kernels (2026-11-13) — in progress
+
+Infrastructure (in the fork; the two fixes above are commit `10a93c0`, this is
+uncommitted on top):
+
+- `CPU_FLAGS_WASM_SIMD128` (`1 << 16`) in `SvtJpegxs.h`; `CPU_FLAGS_ALL` now
+  includes it. `get_cpu_flags()` reports it when the build has
+  `__wasm_simd128__` (an engine without SIMD rejects the module anyway), and
+  `get_asm_level_name_str()` knows it as `wasm_simd128`. `--asm c` /
+  `use_cpu_flags = 0` still select the C kernels, so both paths can be
+  checked in the same wasm binary.
+- Kernels live in `Source/Lib/Decoder/ASM_WASM_SIMD128/` (object library
+  `DECODER_ASM_WASM_SIMD128`, added to `SVT_DECODER_ASM_LIBS` under
+  Emscripten). The sources are wrapped in `#ifdef __wasm_simd128__`, so they
+  are empty without `-msimd128`.
+- `decoder_dsp_rtcd.c`: `SET_WASM_SIMD128(ptr, fn)` overrides an entry after
+  the usual `SET_*` macro when the flag is set.
+- Tests: `scripts/compare-apps.sh` also decodes with the wasm app's
+  `--asm c` and compares both wasm decodes with native; new cases f and g
+  (uniform quantization; g has odd sizes, 1918×1078 4:4:4 12-bit, for partial
+  groups). `test/codec.test.ts` has a matching uniform case (e). All pass,
+  as do `test:browser` and `nix flake check`.
+
+**`dequant_wasm_simd128`**: deadzone (the default) does 16 coefficients
+(4 groups) per iteration. It widens the group masks from the `gcli` bytes
+with one `i8x16.shuffle`, ORs in `1 << (gtli - 1)` where the group is above
+`gtli` and the coefficient is non-zero. Uniform works per group of 4 like the
+SSE4.1 version. It is bit-exact with the C version, including corner cases:
+`gcli` is compared as `int8_t`; wasm shifts count modulo 16, while C shifts an
+`int`; non-`GROUP_SIZE` groups fall back to C. In the profile, dequantization
+drops from about 25% of decode CPU to 1.3%.
+
+Decode ms per frame, fresh process each, on AC:
+
+| Case | threads | C dequant (`10a93c0`) | `dequant_wasm_simd128` | native C | native AVX2/512 |
+|------|---------|-----------------------|------------------------|----------|-----------------|
+| 1080p 4:2:0 8-bit | 3 | 21.7 | 18.4 | 17.6 | 6.8 |
+| | 8 | 5.5 | 4.5 | 5.0 | 1.7 |
+| 1080p 4:2:2 10-bit | 3 | 31.3 | 24.3 | 26.0 | 10.0 |
+| | 8 | 8.4 | 6.3 | 7.3 | 2.5 |
+| 2160p 4:2:2 10-bit | 3 | 87.1 | 74.9 | 75.7 | 29.0 |
+| | 8 | 24.3 | 21.4 | 22.1 | 9.0 |
+
+The wasm decoder now matches or beats native C (whose `dequant_c` doesn't
+vectorize). The remaining gap to native AVX2 is 2.5–3.7×.
 
 ### Next steps (decoder)
 
-1. Commit the two fixes on the fork's `wasm` branch. Check the decoder's init
-   and final stage loops and the encoder's stage loops for the same Liftoff
-   problem.
-2. Hand-written wasm SIMD kernels (step 3), in the order of what native AVX2
-   gains: IDWT horizontal (`idwt_horizontal_line_lf16_hf16`, `_lf32_hf16`)
-   and `linear_output_scaling_16bit_line`, then `idwt_vertical_line*`,
-   `dequant` (the SSE4.1 version is a template), and `inv_sign`.
-   `unpack_data` (entropy decoding) is the largest remaining part, but even
-   AVX2 helps it less.
-3. Step 2 (SSE → wasm SIMD translation) isn't worth it: only `dequant` among
-   the decoder's kernels has an SSE version, and it is easy to write by hand.
-4. Smaller items: the main-thread copy of the decoded frame out of the wasm
+1. Commit the kernel. Check the decoder's init and final stage loops and the
+   encoder's stage loops for the Liftoff problem.
+2. More wasm SIMD kernels, in the order of what native AVX2 gains: IDWT
+   horizontal (`idwt_horizontal_line_lf16_hf16`, `_lf32_hf16`) and
+   `linear_output_scaling_16bit_line`, then `idwt_vertical_line*` and
+   `inv_sign`. `unpack_data` (entropy decoding) is the largest remaining
+   part, but even AVX2 helps it less. Profile again first: dequant no longer
+   dominates.
+3. Smaller items: the main-thread copy of the decoded frame out of the wasm
    heap (about 4.5 ms per 2160p frame) could be avoided by decoding into a
    caller-provided buffer or handing out a view.
