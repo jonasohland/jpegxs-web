@@ -22,6 +22,7 @@
     "build:wasm:single": "emcmake cmake -S . -B build/lib-st -G Ninja -DCMAKE_BUILD_TYPE=Release -DJXS_THREADS=OFF && ninja -C build/lib-st",
     "build:ts": "tsc -p . && cp src/jxs.d.mts src/jxs-st.d.mts dist/",
     "build": "npm run build:wasm && npm run build:ts",
+    "build:demo": "npm run build && node scripts/build-demo.mjs",
     "test": "node --test \"test/**/*.test.ts\"",
     "test:browser": "node test/browser/run.mjs",
     "serve": "node scripts/serve.mjs"

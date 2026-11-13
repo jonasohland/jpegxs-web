@@ -1,0 +1,210 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>JPEG XS decode sample</title>
+  <style>
+    canvas { max-width: 100%; display: block; }
+    fieldset { margin-bottom: 1em; }
+    #results td, #results th { padding: 2px 10px; text-align: right; }
+    #results th:first-child, #results td:first-child { text-align: left; }
+  </style>
+</head>
+<body>
+  <fieldset id="transcode-settings">
+    <legend>1. Transcode</legend>
+    <label>Frames: <input id="frames" type="number" min="1" max="1800" value="1800"></label>
+    <label>Bits per pixel:
+      <select id="bpp">
+        <option>1</option>
+        <option>2</option>
+        <option selected>3</option>
+        <option>4</option>
+      </select>
+    </label>
+    <label>Encoder threads: <input id="encoder-threads" type="number" min="1" max="16"></label>
+    <button id="transcode-button">Transcode</button>
+  </fieldset>
+
+  <fieldset id="player-settings" disabled>
+    <legend>2. Decode and render</legend>
+    <p>
+      Decoder:
+      <label><input type="radio" name="variant" value="threads" checked> threaded build,
+        threads: <input id="threads" type="number" min="1" max="32" size="3"></label>
+      <label><input type="radio" name="variant" value="single"> single-threaded build (no pthreads)</label>
+    </p>
+    <p>
+      Renderer:
+      <label><input type="radio" name="renderer" value="2d" checked> 2D (VideoFrame + drawImage)</label>
+      <label><input type="radio" name="renderer" value="webgl"> WebGL (YUV textures)</label>
+      <label><input type="radio" name="renderer" value="webgl2"> WebGL 2 (YUV textures)</label>
+      <label><input type="radio" name="renderer" value="none"> none (decode only)</label>
+      <label><input id="loop" type="checkbox" checked> Loop</label>
+    </p>
+    <button id="play">Play</button>
+    <button id="stop">Stop</button>
+  </fieldset>
+
+  <fieldset id="bench-settings" disabled>
+    <legend>3. Compare decoder configurations</legend>
+    <label>Thread counts: <input id="bench-threads" size="20"></label>
+    <label><input id="bench-single" type="checkbox" checked> single-threaded build</label>
+    <label>Seconds each: <input id="bench-seconds" type="number" min="1" value="3" size="3"></label>
+    <button id="bench">Run</button>
+    <table id="results">
+      <thead><tr><th>Decoder</th><th>Decode fps</th><th>ms/frame</th><th>Render fps</th><th>Frames</th></tr></thead>
+      <tbody></tbody>
+    </table>
+  </fieldset>
+
+  <table cellspacing="8" id="status">
+    <tr><th align="right">Fetch</th><td id="fetch">Not started</td></tr>
+    <tr><th align="right">Demux</th><td id="demux">Not started</td></tr>
+    <tr><th align="right">Transcode</th><td id="transcode">Not started</td></tr>
+    <tr><th align="right">Decode</th><td id="decode">Not started</td></tr>
+    <tr><th align="right">Render</th><td id="render">Not started</td></tr>
+    <tr><th align="right">Error</th><td id="error"></td></tr>
+  </table>
+
+  <div id="canvas-container"><canvas></canvas></div>
+
+  <script type="module">
+    import { Canvas2DRenderer } from "./renderer_2d.js";
+    import { WebGLRenderer } from "./renderer_webgl.js";
+
+    const $ = (s) => document.querySelector(s);
+    const cores = navigator.hardwareConcurrency || 4;
+    $("#encoder-threads").value = Math.min(cores, 8);
+    $("#threads").value = Math.min(cores, 8);
+    $("#bench-threads").value = [...new Set([3, 4, 6, 8, cores, cores + 2].filter((t) => t <= cores + 2))]
+      .sort((a, b) => a - b).join(", ");
+    if (!crossOriginIsolated) {
+      $("#error").textContent =
+        "This page is not cross-origin isolated (needs HTTPS or localhost, and COOP/COEP headers), transcoding will fail.";
+    }
+
+    function setStatus(status = {}) {
+      for (const key in status) $(`#${key}`).innerText = status[key];
+    }
+
+    /** Starts a worker, forwards its status and resolves with its result. */
+    function run(script, message, transfer = []) {
+      const worker = new Worker(script, { type: "module" });
+      const done = new Promise((resolve, reject) => {
+        worker.addEventListener("message", ({ data }) => {
+          setStatus(data.status);
+          if (data.done) (data.error ? reject : resolve)(data.result);
+        });
+        worker.addEventListener("error", (e) => reject(e));
+      });
+      worker.postMessage(message, transfer);
+      return { worker, done };
+    }
+
+    // 1. Transcode.
+    let clip = null;
+    $("#transcode-button").addEventListener("click", async () => {
+      $("#transcode-settings").disabled = true;
+      setStatus({ error: "" });
+      const { worker, done } = run("./transcode.js", {
+        dataUri: "../../data/bbb.mp4",
+        frameLimit: Number($("#frames").value),
+        bpp: Number($("#bpp").value),
+        threads: Number($("#encoder-threads").value),
+      });
+      try {
+        clip = await done;
+      } catch {
+        $("#transcode-settings").disabled = false;
+        return;
+      } finally {
+        worker.terminate();
+      }
+      $("#player-settings").disabled = false;
+      $("#bench-settings").disabled = false;
+      play();
+    });
+
+    // 2. One decoder worker per decoder configuration, rendering here. A
+    // fresh canvas each time, since the renderer (context type) may change.
+    let player = null;
+    let rafId = 0;
+
+    function playerOptions() {
+      return {
+        variant: $("input[name=variant]:checked").value,
+        threads: Number($("#threads").value),
+        rendererName: $("input[name=renderer]:checked").value,
+        loop: $("#loop").checked,
+      };
+    }
+
+    function startPlayer({ rendererName, ...options }) {
+      stopPlayer();
+      const canvas = document.createElement("canvas");
+      $("#canvas-container").replaceChildren(canvas);
+      const renderer =
+        rendererName === "none" ? null
+        : rendererName === "2d" ? new Canvas2DRenderer(canvas, clip.colorSpace)
+        : new WebGLRenderer(rendererName, canvas, clip.colorSpace);
+      setStatus({ decode: "Starting", render: renderer ? "" : "off", error: "" });
+
+      const { data, offsets } = clip;
+      const current = (player = run("./decoder.js", { data, offsets, ...options }));
+      if (renderer) {
+        current.worker.addEventListener("message", ({ data }) => data.image && renderer.draw(data.image));
+        const tick = () => {
+          current.worker.postMessage({ want: true });
+          rafId = requestAnimationFrame(tick);
+        };
+        rafId = requestAnimationFrame(tick);
+      }
+      return current.done;
+    }
+
+    function stopPlayer() {
+      cancelAnimationFrame(rafId);
+      player?.worker.terminate();
+      player = null;
+    }
+
+    function play() {
+      startPlayer(playerOptions()).catch(() => {});
+    }
+
+    $("#play").addEventListener("click", play);
+    $("#stop").addEventListener("click", () => player?.worker.postMessage({ stop: true }));
+    $("#player-settings").addEventListener("change", play);
+
+    // 3. Benchmark: each configuration in turn, results in the table.
+    $("#bench").addEventListener("click", async () => {
+      $("#player-settings").disabled = $("#bench-settings").disabled = true;
+      const base = playerOptions();
+      const configs = [];
+      if ($("#bench-single").checked) configs.push({ variant: "single", threads: 1 });
+      for (const t of $("#bench-threads").value.split(/[\s,]+/).map(Number).filter((t) => t >= 1)) {
+        configs.push({ variant: "threads", threads: t });
+      }
+      const tbody = $("#results tbody");
+      tbody.replaceChildren();
+      for (const config of configs) {
+        const row = tbody.insertRow();
+        try {
+          const r = await startPlayer({
+            ...base, ...config, loop: true, warmupMs: 1000, durationMs: 1000 * Number($("#bench-seconds").value),
+          });
+          for (const v of [r.label, r.fps.toFixed(0), r.msPerFrame.toFixed(2),
+                           base.rendererName === "none" ? "–" : r.renderFps.toFixed(0), r.frames]) {
+            row.insertCell().textContent = v;
+          }
+        } catch {
+          row.insertCell().textContent = `${config.variant} ${config.threads}: failed, see Error`;
+        }
+      }
+      stopPlayer();
+      $("#player-settings").disabled = $("#bench-settings").disabled = false;
+    });
+  </script>
+</body>
+</html>

@@ -93,6 +93,7 @@ into `third_party/SVT-JPEG-XS/Bin/`.
 | `test/` | `codec.test.ts` (node, bit-exact vs native apps), `browser/` (headless Chrome). |
 | `scripts/serve.mjs` | Static server with COOP/COEP headers (left out for `?no-isolation`). |
 | `scripts/bench.mjs` | Encode/decode timing + output hashes for a dist directory. |
+| `examples/video-decode-display/` | Browser demo modelled on the WebCodecs video-decode-display sample (see below). |
 
 ```sh
 npm run build          # emcmake/ninja into build/lib + build/lib-st, then tsc into dist/
@@ -117,6 +118,44 @@ const codestream = await jxs.encode(
   { width, height, bitDepth: 10, format: "yuv422", planes }, { bpp: 3 });
 await jxs.terminate();
 ```
+
+### Example: video-decode-display
+
+`npm run serve`, then open `http://127.0.0.1:8080/examples/video-decode-display/`
+(needs `npm run build` and `data/bbb.mp4`, which is not in git: Big Buck Bunny,
+1080p60 H.264, non-fragmented MP4).
+
+`npm run build:demo` (`scripts/build-demo.mjs [out-dir]`, default `build/demo`)
+packages it as one directory for any static server: the demo, the parts of
+`dist/` it loads (`lib/`), `bbb.mp4` and an example `nginx.conf`. The server
+must send COOP/COEP on every response, over HTTPS or from localhost, with a
+JavaScript MIME type for `.mjs`.
+
+- `transcode.js` (worker): fetches the file, demuxes it (`demuxer_mp4.js`, a
+  minimal parser for non-fragmented H.264 MP4s, checked against ffprobe), decodes
+  the first N frames with WebCodecs and encodes them with the threaded build
+  (yuv420 8-bit). The codestreams are packed into one `SharedArrayBuffer`.
+  Decoded frames come out as I420 or NV12 (Chrome) or already converted to
+  `BGRX` (Firefox 159); RGB frames are converted back to BT.709 limited-range
+  I420 in JS, which makes transcoding about 3× slower in Firefox.
+- `decoder.js` (worker, one per decoder configuration): decodes in a loop as
+  fast as possible. The page asks for the newest frame on each animation frame
+  and gets it transferred. Switching configuration terminates the worker,
+  which also ends its pthread pool.
+- Renderers (main thread): `2d` wraps the planes in an I420 `VideoFrame` and
+  uses `drawImage` (the WebCodecs sample's 2D path). `webgl`/`webgl2`
+  upload three single-channel textures and convert YUV → RGB in the shader,
+  using the source's `VideoColorSpace` (BT.709 limited range by default).
+- The comparison table runs the single-threaded build and a list of `threads`
+  values for a fixed time each.
+
+Rendering from the decoding worker (OffscreenCanvas + WebGL) throttled the
+decode loop to 60 fps in Chrome, so the worker does no rendering.
+
+Headless Chrome 157, 300 frames at bpp 3, decode only (renderer `none`):
+single-threaded build 134 fps (7.4 ms), `threads: 3` 141 fps, 4: 188, 6: 309,
+8: 347 (2.8 ms), 10: 350. With rendering, decoding drops to roughly half in headless
+Chrome (probably its software GL using the same cores; not checked on a GPU).
 
 ## Status / next steps
 
