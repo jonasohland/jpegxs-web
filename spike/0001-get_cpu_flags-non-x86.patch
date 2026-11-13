@@ -1,0 +1,29 @@
+diff --git a/Source/Lib/Common/Codec/common_dsp_rtcd.c b/Source/Lib/Common/Codec/common_dsp_rtcd.c
+index c68b3ae..3942f9b 100644
+--- a/Source/Lib/Common/Codec/common_dsp_rtcd.c
++++ b/Source/Lib/Common/Codec/common_dsp_rtcd.c
+@@ -41,6 +41,10 @@ CPU_FLAGS get_cpu_flags() {
+ 
+     return flags;
+ }
++#else
++CPU_FLAGS get_cpu_flags() {
++    return 0;
++}
+ #endif /*ARCH_X86_64*/
+ 
+ #ifdef ARCH_X86_64
+diff --git a/Source/Lib/Common/Codec/common_dsp_rtcd.h b/Source/Lib/Common/Codec/common_dsp_rtcd.h
+index 3fdc957..f0e2bc3 100644
+--- a/Source/Lib/Common/Codec/common_dsp_rtcd.h
++++ b/Source/Lib/Common/Codec/common_dsp_rtcd.h
+@@ -28,9 +28,7 @@ extern "C" {
+ #endif
+ 
+ // Helper Functions
+-#ifdef ARCH_X86_64
+ CPU_FLAGS get_cpu_flags();
+-#endif
+ void setup_common_rtcd_internal(CPU_FLAGS flags);
+ uint32_t log2_32_c(uint32_t x);
+ RTCD_EXTERN uint32_t (*svt_log2_32)(uint32_t x);

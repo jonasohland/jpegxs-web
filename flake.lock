@@ -1,0 +1,48 @@
+{
+  "nodes": {
+    "jxs-cuda": {
+      "inputs": {
+        "nixpkgs": [
+          "nixpkgs"
+        ]
+      },
+      "locked": {
+        "lastModified": 1794156460,
+        "narHash": "sha256-JVd1Gn1qZwceVd2o4An5ayhOqzzsaKOkNb/jCnywghE=",
+        "ref": "refs/heads/main",
+        "rev": "0adb524e0857933eac80be2531eca20a62645d71",
+        "revCount": 135,
+        "type": "git",
+        "url": "ssh://git@bitbucket.org/riedelcommunications/jxs-cuda.git"
+      },
+      "original": {
+        "type": "git",
+        "url": "ssh://git@bitbucket.org/riedelcommunications/jxs-cuda.git"
+      }
+    },
+    "nixpkgs": {
+      "locked": {
+        "lastModified": 1794386569,
+        "narHash": "sha256-x9sADJvoVG0L6RejZB+/BB4YiGZFBZrfTlhF4uBq1tQ=",
+        "owner": "NixOS",
+        "repo": "nixpkgs",
+        "rev": "d4f25a3e562008648d45bcf2d70bcc7422cad84e",
+        "type": "github"
+      },
+      "original": {
+        "owner": "NixOS",
+        "ref": "nixos-unstable",
+        "repo": "nixpkgs",
+        "type": "github"
+      }
+    },
+    "root": {
+      "inputs": {
+        "jxs-cuda": "jxs-cuda",
+        "nixpkgs": "nixpkgs"
+      }
+    }
+  },
+  "root": "root",
+  "version": 7
+}
