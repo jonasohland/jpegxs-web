@@ -3,43 +3,73 @@
 <title>jpegxs-web browser test</title>
 <pre id="log"></pre>
 <script type="module">
+  // Loaded twice by run.mjs: cross-origin isolated (threaded build, plus a
+  // forced single-threaded worker) and with ?no-isolation (the default
+  // variant must fall back to the single-threaded build, which only decodes;
+  // codestreams then come from run.mjs).
   import { createJxsWorker } from "/dist/index.js";
   import { makeImage } from "/test/image.js";
+
+  const CASES = [
+    [1920, 1080, "yuv420", 8, 3],
+    [1280, 720, "yuv422", 10, 2.5],
+  ];
 
   const log = (s) => (document.getElementById("log").textContent += s + "\n");
   const hex = async (bytes) =>
     [...new Uint8Array(await crypto.subtle.digest("SHA-256", bytes))].map((b) => b.toString(16).padStart(2, "0")).join("");
 
+  async function decodeCase(jxs, cs) {
+    const info = await jxs.probe(cs);
+    const t = performance.now();
+    const decoded = await jxs.decode(cs);
+    const decodeMs = performance.now() - t;
+    const half = await jxs.decode(cs, { proxy: "half" });
+    return {
+      probe: [info.width, info.height, info.format, info.bitDepth, info.frameSize],
+      decoded: await hex(decoded.data),
+      planeTypes: decoded.planes.map((p) => p.constructor.name),
+      half: [half.width, half.height, await hex(half.data)],
+      decodeMs: Math.round(decodeMs),
+    };
+  }
+
   async function run() {
     const result = { crossOriginIsolated, cases: [] };
-    if (!crossOriginIsolated) throw new Error("page is not cross-origin isolated");
     const jxs = await createJxsWorker({ threads: 4 });
-    for (const [w, h, format, depth, bpp] of [
-      [1920, 1080, "yuv420", 8, 3],
-      [1280, 720, "yuv422", 10, 2.5],
-    ]) {
-      const image = { width: w, height: h, bitDepth: depth, format, data: makeImage(w, h, format, depth) };
-      let t = performance.now();
-      const cs = await jxs.encode(image, { bpp, transfer: true });
-      const encodeMs = performance.now() - t;
-      const info = await jxs.probe(cs);
-      t = performance.now();
-      const decoded = await jxs.decode(cs);
-      const decodeMs = performance.now() - t;
-      const half = await jxs.decode(cs, { proxy: "half" });
-      const c = {
-        size: [w, h, format, depth, bpp],
-        probe: [info.width, info.height, info.format, info.bitDepth, info.frameSize],
-        codestream: await hex(cs),
-        decoded: await hex(decoded.data),
-        planeTypes: decoded.planes.map((p) => p.constructor.name),
-        half: [half.width, half.height, await hex(half.data)],
-        encodeMs: Math.round(encodeMs),
-        decodeMs: Math.round(decodeMs),
-      };
+    result.variant = jxs.variant;
+    const single = crossOriginIsolated ? await createJxsWorker({ variant: "single" }) : jxs;
+    result.singleVariant = single.variant;
+
+    for (const [i, [w, h, format, depth, bpp]] of CASES.entries()) {
+      const c = { size: [w, h, format, depth, bpp] };
+      let cs;
+      if (crossOriginIsolated) {
+        const image = { width: w, height: h, bitDepth: depth, format, data: makeImage(w, h, format, depth) };
+        const t = performance.now();
+        cs = await jxs.encode(image, { bpp, transfer: true });
+        c.encodeMs = Math.round(performance.now() - t);
+        c.codestream = await hex(cs);
+        Object.assign(c, await decodeCase(jxs, cs));
+      } else {
+        cs = new Uint8Array(await (await fetch(`/codestream/${i}`)).arrayBuffer());
+        c.codestream = await hex(cs);
+      }
+      c.single = await decodeCase(single, cs);
       log(JSON.stringify(c));
       result.cases.push(c);
     }
+
+    if (!crossOriginIsolated) {
+      try {
+        const [w, h, format, depth] = CASES[0];
+        await jxs.encode({ width: w, height: h, bitDepth: depth, format, data: makeImage(w, h, format, depth) }, { bpp: 3 });
+        result.encodeError = "no error thrown";
+      } catch (e) {
+        result.encodeError = e.message;
+      }
+    }
+
     try {
       await jxs.decode(new Uint8Array(1000));
       result.error = "no error thrown";
@@ -47,6 +77,7 @@
       result.error = [e.name, e.code, e.message];
     }
     await jxs.terminate();
+    if (single !== jxs) await single.terminate();
     return result;
   }
 

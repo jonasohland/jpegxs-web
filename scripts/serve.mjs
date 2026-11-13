@@ -1,5 +1,7 @@
 // Static file server for the repo root with the cross-origin isolation
-// headers that SharedArrayBuffer (wasm threads) requires.
+// headers that SharedArrayBuffer (wasm threads) requires. Requests with a
+// `no-isolation` query parameter get no such headers, so a page loaded that way
+// is not isolated (and gets the single-threaded build).
 // Usage: node scripts/serve.mjs [port]   (0 picks a free port)
 import { createServer } from "node:http";
 import { readFile } from "node:fs/promises";
@@ -23,11 +25,14 @@ const TYPES = {
  */
 export function serve(port, hook) {
   const server = createServer(async (req, res) => {
-    res.setHeader("Cross-Origin-Opener-Policy", "same-origin");
-    res.setHeader("Cross-Origin-Embedder-Policy", "require-corp");
+    const url = new URL(req.url ?? "/", "http://x");
+    if (!url.searchParams.has("no-isolation")) {
+      res.setHeader("Cross-Origin-Opener-Policy", "same-origin");
+      res.setHeader("Cross-Origin-Embedder-Policy", "require-corp");
+    }
     res.setHeader("Cache-Control", "no-store");
     if (hook?.(req, res)) return;
-    const path = normalize(decodeURIComponent(new URL(req.url ?? "/", "http://x").pathname));
+    const path = normalize(decodeURIComponent(url.pathname));
     let file = join(ROOT, path);
     if (!file.startsWith(ROOT)) return void res.writeHead(403).end();
     if (path.endsWith("/")) file = join(file, "index.html");

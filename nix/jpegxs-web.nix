@@ -9,7 +9,8 @@
   src,
 }:
 
-# The jpegxs-web npm package: dist/jxs.{mjs,wasm} (emcmake) plus the compiled
+# The jpegxs-web npm package: dist/jxs.{mjs,wasm} (threaded) and
+# dist/jxs-st.{mjs,wasm} (single-threaded), both from emcmake, plus the compiled
 # TypeScript wrapper. $out is the package directory (package.json + dist/),
 # usable with `npm install <store path>`.
 stdenvNoCC.mkDerivation {
@@ -30,6 +31,7 @@ stdenvNoCC.mkDerivation {
   configurePhase = ''
     runHook preConfigure
     emcmake cmake -S . -B build/lib -G Ninja -DCMAKE_BUILD_TYPE=Release
+    emcmake cmake -S . -B build/lib-st -G Ninja -DCMAKE_BUILD_TYPE=Release -DJXS_THREADS=OFF
     runHook postConfigure
   '';
 
@@ -37,8 +39,9 @@ stdenvNoCC.mkDerivation {
   buildPhase = ''
     runHook preBuild
     ninja -C build/lib
+    ninja -C build/lib-st
     tsc -p .
-    cp src/jxs.d.mts dist/
+    cp src/jxs.d.mts src/jxs-st.d.mts dist/
     runHook postBuild
   '';
 

@@ -242,3 +242,79 @@ describe("encode", () => {
     );
   });
 });
+
+// jxs-st.wasm: built without threads, decodes inline, cannot encode. Its
+// output must equal the threaded build's (and the native decoder's).
+describe("single-threaded variant", () => {
+  let st: JxsCodec;
+  before(async () => {
+    st = await JxsCodec.create({ variant: "single" });
+  });
+  after(() => st.dispose());
+
+  test("variant selection", () => {
+    assert.equal(st.variant, "single");
+    assert.equal(codec.variant, "threads"); // "auto" under node
+  });
+
+  test("decodes every case like the threaded build", () => {
+    for (const c of CASES) {
+      const image = { width: c.width, height: c.height, bitDepth: c.depth, format: c.format };
+      const codestream = codec.encode({ ...image, data: makeImage(c.width, c.height, c.format, c.depth) }, c.options);
+      for (const proxy of ["full", "half", "quarter"] as const) {
+        // Not every coding supports every proxy mode; then both must fail alike.
+        const run = (x: JxsCodec) => {
+          try {
+            return x.decode(codestream, { proxy }).data;
+          } catch (e) {
+            assert.ok(e instanceof JxsError);
+            return e.code;
+          }
+        };
+        const expected = run(codec);
+        const actual = run(st);
+        if (typeof expected === "number") assert.equal(actual, expected, `case ${c.name} ${proxy}: error code`);
+        else sameBytes(actual as Uint8Array, expected, `case ${c.name} ${proxy}`);
+      }
+      if (native) sameBytes(st.decode(codestream).data, nativeDecode(`st-${c.name}`, codestream), `case ${c.name} vs native`);
+    }
+  });
+
+  test("decoder reuse and reopen", () => {
+    const img = { width: 640, height: 360, bitDepth: 10, format: "yuv422" as const };
+    const sequence = [
+      codec.encode({ ...img, data: makeImage(640, 360, "yuv422", 10, 1) }, { bpp: 3 }),
+      codec.encode({ ...img, data: makeImage(640, 360, "yuv422", 10, 2) }, { bpp: 3, sliceHeight: 8 }),
+      codec.encode({ width: 320, height: 240, bitDepth: 8, format: "yuv420", data: makeImage(320, 240, "yuv420", 8) }, { bpp: 2 }),
+      codec.encode({ ...img, data: makeImage(640, 360, "yuv422", 10, 3) }, { bpp: 3, decompV: 2, decompH: 4 }),
+      codec.encode({ ...img, data: makeImage(640, 360, "yuv422", 10, 4) }, { bpp: 3, decompV: 0 }),
+    ];
+    sequence.forEach((cs, i) => sameBytes(st.decode(cs).data, codec.decode(cs).data, `frame ${i}`));
+  });
+
+  test("invalid and truncated input throw JxsError with the same code", () => {
+    const cs = codec.encode(
+      { width: 640, height: 360, bitDepth: 10, format: "yuv422", data: makeImage(640, 360, "yuv422", 10) },
+      { bpp: 3 },
+    );
+    const code = (c: JxsCodec, data: Uint8Array) => {
+      try {
+        c.decode(data);
+      } catch (e) {
+        assert.ok(e instanceof JxsError);
+        return e.code;
+      }
+      assert.fail("expected a JxsError");
+    };
+    for (const data of [new Uint8Array(1000), cs.subarray(0, cs.length >> 1)]) {
+      assert.equal(code(st, data), code(codec, data));
+    }
+    sameBytes(st.decode(cs).data, codec.decode(cs).data, "usable afterwards");
+  });
+
+  test("encoding is not available", () => {
+    const image = { width: 320, height: 240, bitDepth: 8, format: "yuv420" as const };
+    assert.equal(st.encoderConfig(image, { bpp: 2 }).width, 320);
+    assert.throws(() => st.encode({ ...image, data: makeImage(320, 240, "yuv420", 8) }, { bpp: 2 }), /threaded variant/);
+  });
+});

@@ -87,7 +87,7 @@ Measured against the plain-C baseline:
 Target, reached: 1080p at 60 fps with a single decoding thread. The encoder
 was not optimized beyond `-msimd128`.
 
-### Phase 5 — Single-threaded fallback for non-isolated pages (investigation)
+### Phase 5 — Single-threaded fallback for non-isolated pages — decoder done, see results below
 
 After the performance work. The pthreads build needs `SharedArrayBuffer`, so
 it only runs on cross-origin isolated pages (COOP/COEP). Investigate a second
@@ -125,6 +125,10 @@ changes but requires cross-origin isolation for every embedding page.
 Supporting non-isolated pages requires a second build that runs the stage
 kernels inline (a real refactor of `DecHandle.c` / `EncHandle.c` and the stage
 files). To be investigated in Phase 5.
+
+Resolved in Phase 5 for the decoder: the fork runs the decoder stages inline
+when built without threads (no refactor of the stage files needed), and the
+JS side picks that build automatically. Encoding still needs isolation.
 
 ## Phase 0 results (2026-11-13)
 
@@ -568,3 +572,130 @@ Not planned for now; listed in case more speed is needed later:
 - Encoder: wasm kernels, and the Liftoff check of its stage loops.
 - Upstreaming candidates: the `Packing.c` changes, `FORCE_INLINE`/`NOINLINE`,
   the `get_cpu_flags()` fix and `ENABLE_X86_ASM`.
+
+## Phase 5 results (2026-11-13)
+
+**Decoder done.** A second build, `dist/jxs-st.{mjs,wasm}`, runs without
+pthreads, so it needs no `SharedArrayBuffer` or cross-origin isolation.
+`JxsCodec.create()` / `createJxsWorker()` pick it automatically when threads
+are unavailable. Its output is bit-exact with the threaded build and the
+native decoder, including error codes on corrupt streams. The encoder is not
+available in that build.
+
+All changes are uncommitted, in the fork and in this repo.
+
+### How the pipeline runs without threads
+
+The second option from the list above, a build-time switch in the fork, but
+narrower than replacing the thread primitives: the decoder gets an *inline
+mode* that skips the stage threads and their queues.
+
+- CMake option `ENABLE_THREADS` (default `ON`). `OFF` defines
+  `SVT_JXS_NO_THREADS` and, under Emscripten, drops `-pthread`. It refuses
+  `BUILD_APPS` (the apps use their own send/receive threads).
+- `svt_jpeg_xs_decoder_init` (inline mode): allocates one decoder instance, one
+  slice context and the output queue. No init/universal/final queues, no ring
+  buffer, no threads. Packetization mode (`send_packet`) is rejected with
+  `BadParameter`.
+- `svt_jpeg_xs_decoder_send_frame` calls `decode_frame_inline()`
+  (`DecThreadInit.c`) and posts the result to the output queue, so
+  `svt_jpeg_xs_decoder_get_frame` works unchanged; it just never blocks. A full
+  output queue returns `NoErrorEmptyQueue` instead of blocking forever.
+  `send_eoc` posts the EOC result directly. Callbacks are called synchronously.
+- `decode_frame_inline()` does what one universal thread plus the final
+  thread do: parse the header, then for each slice find its size,
+  `svt_jpeg_xs_decode_slice`, then that slice's
+  `svt_jpeg_xs_decode_final_slice_overlap`, then `svt_jpeg_xs_decode_final`
+  for `Cpih != 0`. It stops at the first failing slice. The final stage also
+  reports the lowest failing slice's error, so error codes match the
+  one-worker threaded decoder. The slice-size and EOC checks moved out of
+  `send_slices_tasks()` into `get_frame_slice_size()`, shared by both paths.
+- `svt_jxs_create_thread()` fails without threads (emscripten's non-pthread
+  libc lacks `pthread_setschedparam`), and `svt_jpeg_xs_encoder_init` returns
+  `SvtJxsErrorUndefined`.
+
+The diff is additive apart from that small refactor, so it rebases easily and
+could go upstream. A native gcc build with `ENABLE_THREADS=OFF
+ENABLE_X86_ASM=OFF` compiles cleanly. The inline path is not tested natively
+(no native test harness without the apps).
+
+In this repo:
+
+- Root CMake option `JXS_THREADS` (default `ON`). `OFF` builds `jxs-st.mjs` /
+  `jxs-st.wasm` (`JXS_OUTPUT_NAME`) without the pthread link flags.
+  `npm run build:wasm` builds both (`build/lib`, `build/lib-st`); so does
+  `nix/jpegxs-web.nix`.
+- `JxsCodecOptions.variant`: `"auto"` (default), `"threads"` or `"single"`.
+  Auto picks threads when `SharedArrayBuffer` exists and `crossOriginIsolated`
+  isn't `false` (node: threads). The module is loaded with a dynamic
+  `import()`, so only the chosen build is fetched. `JxsCodec.variant` and
+  `JxsWorkerClient.variant` report the choice. `encode()` on the single
+  variant throws a plain `Error`; `encoderConfig()` still works.
+- `scripts/serve.mjs` leaves out COOP/COEP for requests with `?no-isolation`.
+
+### Verification
+
+- `npm test`: 19 tests. New suite "single-threaded variant": every case at
+  full/half/quarter proxy against the threaded build (or the same error code
+  when the proxy mode is unsupported) and the native decoder; decoder reuse
+  across slice heights 8/16, `decompV` 0/2 and a shape change; invalid and
+  truncated input give the same error codes; encoding is refused.
+- `test:browser` now loads the page twice. Isolated: threaded worker plus a
+  forced `variant: "single"` worker. With `?no-isolation`: `auto` must pick
+  `single`, decode codestreams served by `run.mjs` and refuse to encode. All
+  hashes equal the node build. Passes in headless Chrome.
+- Ad-hoc sweep (script not in the repo): 5 sizes (incl. 333×197) × 9 coding
+  configurations (slice heights 8–64, `decompV` 0–2, vpred, sign coding,
+  uniform quantization) × proxy modes, plus 6 bit-flipped and one truncated
+  stream each: 440 decodes, single-threaded identical to `threads: 3`
+  (output and error code). `threads: 8` reports a different error code
+  (`DecoderInternal`, from the multi-worker slice sync) for 48 corrupt
+  streams; its output for valid streams is identical.
+- `nix flake check` passes. The package builds both variants, and `jpegxs-web-test`
+  runs the 19 tests with the native apps required. The threaded wasm apps check
+  is unchanged and still bit-exact.
+
+### Cost
+
+Decode ms per frame, node 24, AC power, one case per process, median of 50
+frames, two runs each:
+
+| Case | single (`jxs-st`) | `threads: 3` (one worker) |
+|------|-------------------|---------------------------|
+| 1080p 4:2:0 8-bit, bpp 3 | 8.3–8.8 | 8.0–8.3 |
+| 1080p 4:2:2 10-bit, bpp 4 | 11.6–12.3 | 11.4–11.5 |
+| 720p 4:4:4 12-bit, bpp 6 | 16.5–16.6 | 16.3–17.0 |
+| 2160p 4:2:2 10-bit, bpp 3 | 41.0–41.8 | 34.6–36.0 |
+
+1080p stays within the 60 fps budget. The single-threaded build is 3–7% slower
+at 1080p and about 17% slower at 2160p. Most likely the threaded decoder's
+final thread runs the slice-overlap IDWT in parallel with the worker's next
+slice, and inline it runs serially. Not profiled.
+
+Download size (the browser fetches only one of the two):
+
+| File | raw | gzip | brotli |
+|------|-----|------|--------|
+| `jxs.wasm` | 238 KB | 90 KB | 73 KB |
+| `jxs-st.wasm` | 107 KB | 44 KB | 37 KB |
+| `jxs.mjs` | 28 KB | 8.5 KB | 7.7 KB |
+| `jxs-st.mjs` | 12 KB | 4.2 KB | 3.8 KB |
+
+`jxs-st.wasm` is less than half the size because LTO drops the unreachable
+encoder.
+
+**Liftoff carry-over:** not an issue. The inline path is called once per
+frame, so the hot functions tier up normally: `node --no-liftoff` gives the
+same times (1080p 4:2:2 10-bit 12.3 vs 11.6 ms, 2160p 40.9 vs 41.0 ms).
+
+### Open points
+
+- Encoder without threads: its pipeline has more stages (init, DWT and pack
+  arrays, final) and the stage loops would need the same treatment. Not
+  started; currently encoding requires isolation.
+- `wasmUrl` / `locateFile` apply to whichever variant is chosen. A page that
+  hosts the `.wasm` files elsewhere must provide both.
+- The 2160p gap could be closed by deferring the overlap IDWT; not needed for
+  the 1080p target.
+- Commit the fork changes and bump the submodule (the clean-tree Nix build
+  fetches the submodule commit from the remote).

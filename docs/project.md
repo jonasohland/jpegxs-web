@@ -26,7 +26,7 @@ tracked by git (at least staged) to be visible to the flake.
 |-------------------------|-------------|
 | `svt-jpegxs` (default)  | Native build of the SVT-JPEG-XS submodule (`nix/svt-jpegxs.nix`): shared library `libSvtJpegxs.so`, headers under `include/svt-jpegxs`, pkg-config file `SvtJpegxs.pc`, and the apps `SvtJpegxsDecApp`, `SvtJpegxsEncApp`, `SvtJpegxsSampleDecoder`, `SvtJpegxsSampleEncoder`. Serves as the reference decoder for validating the wasm build. |
 | `svt-jpegxs-wasm`       | WebAssembly build of the same submodule (`nix/svt-jpegxs-wasm.nix`), configured with `emcmake` and `ENABLE_X86_ASM=OFF` (portable C code paths, pthreads). Installs the static `libSvtJpegxs.a`, headers, pkg-config file and the four apps as node CLIs (`bin/*.js` + `bin/*.wasm`, run with `node bin/SvtJpegxsDecApp.js ...`). Code linking the static library must also be compiled and linked with `-pthread`. |
-| `jpegxs-web`            | The npm package (`nix/jpegxs-web.nix`): `package.json` + `dist/` (`jxs.mjs`/`jxs.wasm` and the compiled TypeScript), same as `npm run build`. `npm install` the store path to use it. |
+| `jpegxs-web`            | The npm package (`nix/jpegxs-web.nix`): `package.json` + `dist/` (`jxs.mjs`/`jxs.wasm`, the single-threaded `jxs-st.mjs`/`jxs-st.wasm` and the compiled TypeScript), same as `npm run build`. `npm install` the store path to use it. |
 | `jxs-cuda`              | CUDA JPEG XS encoder/decoder, re-exported from the `jxs-cuda` flake. Provides the `jxs` CLI. |
 
 ```sh
@@ -87,26 +87,30 @@ into `third_party/SVT-JPEG-XS/Bin/`.
 
 | Path | Contents |
 |------|----------|
-| `CMakeLists.txt` | Builds `dist/jxs.mjs` + `dist/jxs.wasm` (emcmake) from the submodule and the shim. |
+| `CMakeLists.txt` | Builds `dist/jxs.mjs` + `dist/jxs.wasm` (emcmake) from the submodule and the shim; with `-DJXS_THREADS=OFF` the single-threaded `dist/jxs-st.*`. |
 | `csrc/jxs.c` | C shim with plain exported functions. |
 | `src/` | TypeScript: `JxsCodec` (sync, `jpegxs-web/codec`), Worker + `createJxsWorker()` (Promise API, main entry). |
 | `test/` | `codec.test.ts` (node, bit-exact vs native apps), `browser/` (headless Chrome). |
-| `scripts/serve.mjs` | Static server with COOP/COEP headers. |
+| `scripts/serve.mjs` | Static server with COOP/COEP headers (left out for `?no-isolation`). |
 | `scripts/bench.mjs` | Encode/decode timing + output hashes for a dist directory. |
 
 ```sh
-npm run build          # emcmake/ninja into build/lib, then tsc into dist/
+npm run build          # emcmake/ninja into build/lib + build/lib-st, then tsc into dist/
 npm test               # node tests (native comparisons need the dev shell)
 npm run test:browser   # headless Chrome (CHROME=... to override)
 npm run serve          # http://127.0.0.1:8080/ with cross-origin isolation
 ```
 
-Browser usage (the page must send `Cross-Origin-Opener-Policy: same-origin`
-and `Cross-Origin-Embedder-Policy: require-corp`):
+Browser usage. With `Cross-Origin-Opener-Policy: same-origin` and
+`Cross-Origin-Embedder-Policy: require-corp` the page gets the threaded build.
+Without them, `createJxsWorker()` falls back to the single-threaded build
+(`variant: "auto"`, the default), which decodes at about one-worker speed but
+cannot encode:
 
 ```js
 import { createJxsWorker } from "jpegxs-web";
 const jxs = await createJxsWorker({ threads: 4 });
+jxs.variant;  // "threads" or "single"
 const info = await jxs.probe(bytes);
 const { planes, data, width, height } = await jxs.decode(bytes, { proxy: "full" });
 const codestream = await jxs.encode(
@@ -119,6 +123,6 @@ await jxs.terminate();
 See [plan.md](plan.md). Phases 0 (spike), 1 (build support in the fork,
 branch `wasm`), 2 (C shim + TypeScript/Worker wrapper), 3 (Nix package +
 checks) and 4 (performance: wasm SIMD kernels and decoder fixes; 1080p
-decodes at 60 fps on one thread) are done. Next is Phase 5, a single-threaded
-fallback for pages that aren't cross-origin isolated. Benchmark:
-`node scripts/bench.mjs [dist-dir]`.
+decodes at 60 fps on one thread) are done. Phase 5, the single-threaded build
+for pages that aren't cross-origin isolated, is done for the decoder (not yet
+committed). Benchmark: `node scripts/bench.mjs [dist-dir] [--threads 3,st]`.

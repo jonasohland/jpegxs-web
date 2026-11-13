@@ -1,7 +1,11 @@
 #!/usr/bin/env node
 // Encode/decode throughput benchmark for a built jpegxs-web dist directory.
 //
-//   node scripts/bench.mjs [dist-dir] [--threads 1,4] [--frames 30] [--json]
+//   node scripts/bench.mjs [dist-dir] [--threads 1,4,st] [--frames 30] [--json]
+//
+// `st` in --threads decodes with the single-threaded variant (jxs-st.wasm); it
+// cannot encode, so the codestream comes from the threaded variant (4 threads)
+// and no encode time is reported.
 //
 // For every case and thread count it reports the median and minimum time per
 // frame (after warm-up) and a SHA-256 of the codestream and decoded output, so
@@ -52,12 +56,17 @@ function time(fn) {
 }
 
 const results = [];
-for (const threads of values.threads.split(",").map(Number)) {
-  const codec = await JxsCodec.create({ threads });
+for (const spec of values.threads.split(",")) {
+  const single = spec === "st";
+  const threads = single ? "st" : Number(spec);
+  const codec = await JxsCodec.create(single ? { variant: "single" } : { variant: "threads", threads });
+  const encoder = single ? await JxsCodec.create({ variant: "threads", threads: 4 }) : codec;
   for (const c of selected) {
     const data = makeImage(c.width, c.height, c.format, c.depth);
     const image = { width: c.width, height: c.height, bitDepth: c.depth, format: c.format, data };
-    const enc = time(() => codec.encode(image, c.options));
+    const enc = single
+      ? { out: encoder.encode(image, c.options), median: NaN, min: NaN }
+      : time(() => codec.encode(image, c.options));
     const dec = time(() => codec.decode(enc.out));
     const r = {
       case: c.name,
@@ -78,6 +87,7 @@ for (const threads of values.threads.split(",").map(Number)) {
     }
   }
   codec.dispose();
+  if (encoder !== codec) encoder.dispose();
 }
 if (values.json) console.log(JSON.stringify(results, null, 2));
 process.exit(0);

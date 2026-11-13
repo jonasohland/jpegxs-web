@@ -17,8 +17,10 @@
   },
   "files": ["dist"],
   "scripts": {
-    "build:wasm": "emcmake cmake -S . -B build/lib -G Ninja -DCMAKE_BUILD_TYPE=Release && ninja -C build/lib",
-    "build:ts": "tsc -p . && cp src/jxs.d.mts dist/",
+    "build:wasm": "npm run build:wasm:threads && npm run build:wasm:single",
+    "build:wasm:threads": "emcmake cmake -S . -B build/lib -G Ninja -DCMAKE_BUILD_TYPE=Release && ninja -C build/lib",
+    "build:wasm:single": "emcmake cmake -S . -B build/lib-st -G Ninja -DCMAKE_BUILD_TYPE=Release -DJXS_THREADS=OFF && ninja -C build/lib-st",
+    "build:ts": "tsc -p . && cp src/jxs.d.mts src/jxs-st.d.mts dist/",
     "build": "npm run build:wasm && npm run build:ts",
     "test": "node --test \"test/**/*.test.ts\"",
     "test:browser": "node test/browser/run.mjs",

@@ -1,4 +1,3 @@
-import createJxsModule from "./jxs.mjs";
 import * as abi from "./abi.js";
 import type { JxsModule, JxsModuleArgs } from "./abi.js";
 import {
@@ -14,18 +13,49 @@ import {
   JxsError,
 } from "./types.js";
 
+/**
+ * Which wasm build to load:
+ * - `"threads"`: `jxs.wasm`, built with pthreads. Needs `SharedArrayBuffer`, so
+ *   in a browser the page must be cross-origin isolated.
+ * - `"single"`: `jxs-st.wasm`, without threads. Works on any page, decodes on
+ *   the calling thread (like `threads: 3`, one slice worker) and cannot encode.
+ * - `"auto"` (default): `"threads"` if `SharedArrayBuffer` is usable,
+ *   otherwise `"single"`.
+ */
+export type JxsVariant = "auto" | "threads" | "single";
+
 export interface JxsCodecOptions {
+  /** See {@link JxsVariant}. */
+  variant?: JxsVariant;
   /**
    * Codec threads per encoder/decoder instance. Defaults to the number of
-   * logical cores, capped at 8.
+   * logical cores, capped at 8. Ignored by the single-threaded variant.
    */
   threads?: number;
   /** SVT verbosity (0 = silent, see VerboseMessages in SvtJpegxs.h). */
   verbose?: number;
-  /** Passed to emscripten, e.g. to serve jxs.wasm from another location. */
+  /**
+   * Passed to emscripten, e.g. to serve jxs.wasm / jxs-st.wasm from another
+   * location.
+   */
   locateFile?: (path: string, prefix: string) => string;
-  /** Precompiled/fetched jxs.wasm bytes. */
+  /** Fetched bytes of the selected variant's .wasm file. */
   wasmBinary?: ArrayBuffer;
+}
+
+/** Whether the threaded build can run here (shared wasm memory). */
+export function threadsSupported(): boolean {
+  if (typeof SharedArrayBuffer === "undefined") return false;
+  // Browsers expose SharedArrayBuffer only on cross-origin isolated pages,
+  // but check explicitly in case it is polyfilled or exposed anyway.
+  const isolated = (globalThis as { crossOriginIsolated?: boolean }).crossOriginIsolated;
+  return isolated !== false;
+}
+
+function resolveVariant(variant: JxsVariant = "auto"): "threads" | "single" {
+  if (variant === "auto") return threadsSupported() ? "threads" : "single";
+  if (variant !== "threads" && variant !== "single") throw new RangeError(`unknown variant: ${String(variant)}`);
+  return variant;
 }
 
 const FORMAT_NAMES = new Map<number, ColourFormat>(
@@ -90,14 +120,17 @@ interface EncoderState {
 /**
  * Synchronous JPEG XS encoder/decoder on top of the wasm module.
  *
- * Calls block until the codec's worker threads are done, so in a browser this
- * must run inside a Worker (see createJxsWorker). In node it can be used
+ * Calls block until the frame is done (with the threaded variant, until the
+ * codec's worker threads are done), so in a browser this should run inside a
+ * Worker (see createJxsWorker). In node it can be used
  * directly.
  *
  * The last used decoder and encoder are kept open and reused while the stream
  * shape / encoder parameters stay the same.
  */
 export class JxsCodec {
+  /** The wasm build in use. */
+  readonly variant: "threads" | "single";
   private readonly mod: JxsModule;
   private readonly threads: number;
   private readonly verbose: number;
@@ -109,22 +142,26 @@ export class JxsCodec {
   private disposed = false;
 
   static async create(options: JxsCodecOptions = {}): Promise<JxsCodec> {
-    const threads = Math.max(1, Math.floor(options.threads ?? defaultThreads()));
+    const variant = resolveVariant(options.variant);
+    const threads = variant === "single" ? 1 : Math.max(1, Math.floor(options.threads ?? defaultThreads()));
+    const args: JxsModuleArgs = {};
     // Each pipeline uses at most max(threads, 4) threads; one decoder and one
     // encoder may be open at the same time.
-    const args: JxsModuleArgs = { jxsThreadPoolSize: 2 * Math.max(threads, 4) };
+    if (variant === "threads") args.jxsThreadPoolSize = 2 * Math.max(threads, 4);
     if (options.locateFile) args.locateFile = options.locateFile;
     if (options.wasmBinary) args.wasmBinary = options.wasmBinary;
+    const { default: createJxsModule } = variant === "threads" ? await import("./jxs.mjs") : await import("./jxs-st.mjs");
     const mod = (await createJxsModule(args)) as JxsModule;
-    return new JxsCodec(mod, threads, options.verbose ?? 0);
+    return new JxsCodec(mod, variant, threads, options.verbose ?? 0);
   }
 
-  private constructor(mod: JxsModule, threads: number, verbose: number) {
+  private constructor(mod: JxsModule, variant: "threads" | "single", threads: number, verbose: number) {
     if (mod._jxs_api_version() !== abi.API_VERSION) throw new Error("jxs.wasm API version mismatch");
     if (mod._jxs_info_len() !== abi.INFO_LEN || mod._jxs_enc_params_len() !== abi.ENC_PARAMS_LEN) {
       throw new Error("jxs.wasm ABI mismatch");
     }
     this.mod = mod;
+    this.variant = variant;
     this.threads = threads;
     this.verbose = verbose;
     // info array | encoder params | pointer/size out-param
@@ -229,9 +266,12 @@ export class JxsCodec {
     return { ...infoToImage(info), frameSize: info[abi.INFO_FRAME_SIZE]! };
   }
 
-  /** Encodes one frame and returns its codestream. */
+  /** Encodes one frame and returns its codestream. Needs the `"threads"` variant. */
   encode(image: EncodeImage, options: EncodeOptions): Uint8Array {
     this.assertAlive();
+    if (this.variant === "single") {
+      throw new Error("encoding needs the threaded variant (SharedArrayBuffer, cross-origin isolated page)");
+    }
     const params = this.writeParams(image, options);
     let enc = this.encoder;
     if (!enc || !params.every((v, i) => v === enc!.params[i])) {

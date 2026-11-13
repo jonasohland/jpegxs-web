@@ -19,7 +19,7 @@ function handle(req: Request): [unknown, Transferable[]] | Promise<[unknown, Tra
       ...(wasmUrl ? { locateFile: (path: string, prefix: string) => (path.endsWith(".wasm") ? wasmUrl : prefix + path) } : {}),
     }).then((c) => {
       codec = c;
-      return [null, []];
+      return [c.variant, []];
     });
   }
   if (!codec) throw new Error("JxsCodec not initialized");

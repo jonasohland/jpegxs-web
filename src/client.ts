@@ -27,11 +27,14 @@ type Distribute<T> = T extends unknown ? Omit<T, "id"> : never;
 /**
  * Promise-based JPEG XS codec running in a dedicated Worker.
  *
- * The wasm module uses threads, so the page must be cross-origin isolated
- * (`Cross-Origin-Opener-Policy: same-origin` and
- * `Cross-Origin-Embedder-Policy: require-corp`).
+ * The threaded wasm build needs `SharedArrayBuffer`, so the page must be
+ * cross-origin isolated (`Cross-Origin-Opener-Policy: same-origin` and
+ * `Cross-Origin-Embedder-Policy: require-corp`). Elsewhere the default
+ * `variant: "auto"` loads the single-threaded build, which decodes only.
  */
 export class JxsWorkerClient {
+  /** The wasm build the worker loaded (known once createJxsWorker resolves). */
+  variant: "threads" | "single" | undefined;
   private nextId = 1;
   private readonly pending = new Map<number, { resolve: (v: unknown) => void; reject: (e: Error) => void }>();
 
@@ -74,8 +77,8 @@ export class JxsWorkerClient {
   }
 
   /** @internal */
-  init(options: WorkerCodecOptions): Promise<void> {
-    return this.call({ op: "init", options });
+  async init(options: WorkerCodecOptions): Promise<void> {
+    this.variant = await this.call<"threads" | "single">({ op: "init", options });
   }
 
   probe(data: Uint8Array, options: DecodeOptions = {}): Promise<ProbeResult> {
