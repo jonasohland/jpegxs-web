@@ -26,13 +26,24 @@ tracked by git (at least staged) to be visible to the flake.
 |-------------------------|-------------|
 | `svt-jpegxs` (default)  | Native build of the SVT-JPEG-XS submodule (`nix/svt-jpegxs.nix`): shared library `libSvtJpegxs.so`, headers under `include/svt-jpegxs`, pkg-config file `SvtJpegxs.pc`, and the apps `SvtJpegxsDecApp`, `SvtJpegxsEncApp`, `SvtJpegxsSampleDecoder`, `SvtJpegxsSampleEncoder`. Serves as the reference decoder for validating the wasm build. |
 | `svt-jpegxs-wasm`       | WebAssembly build of the same submodule (`nix/svt-jpegxs-wasm.nix`), configured with `emcmake` and `ENABLE_X86_ASM=OFF` (portable C code paths, pthreads). Installs the static `libSvtJpegxs.a`, headers, pkg-config file and the four apps as node CLIs (`bin/*.js` + `bin/*.wasm`, run with `node bin/SvtJpegxsDecApp.js ...`). Code linking the static library must also be compiled and linked with `-pthread`. |
+| `jpegxs-web`            | The npm package (`nix/jpegxs-web.nix`): `package.json` + `dist/` (`jxs.mjs`/`jxs.wasm` and the compiled TypeScript), same as `npm run build`. `npm install` the store path to use it. |
 | `jxs-cuda`              | CUDA JPEG XS encoder/decoder, re-exported from the `jxs-cuda` flake. Provides the `jxs` CLI. |
 
 ```sh
 nix build .#svt-jpegxs   # or just: nix build
 nix build .#svt-jpegxs-wasm
+nix build .#jpegxs-web
 nix build .#jxs-cuda
 ```
+
+### Checks
+
+`nix flake check` builds the packages above (except `jxs-cuda`) and runs:
+
+| Check | Description |
+|-------|-------------|
+| `svt-jpegxs-wasm-apps` | `scripts/compare-apps.sh`: the wasm Enc/Dec apps (under node) vs the native apps, byte-for-byte, on synthetic 8/10/12-bit 4:2:0/4:2:2/4:4:4 frames. Also checks native C vs native SIMD. |
+| `jpegxs-web-test` | `test/codec.test.ts` against the `jpegxs-web` package, with native comparisons required (`JXS_REQUIRE_NATIVE=1`). |
 
 ### Overlay
 
@@ -62,7 +73,7 @@ Manual wasm build in the dev shell:
 emcmake cmake -S third_party/SVT-JPEG-XS -B build/wasm -G Ninja \
   -DCMAKE_BUILD_TYPE=Release -DCMAKE_OUTPUT_DIRECTORY=$PWD/build/wasm/bin
 ninja -C build/wasm
-spike/compare.sh build/wasm/bin <work-dir>   # bit-exactness vs native
+scripts/compare-apps.sh "$(dirname "$(which SvtJpegxsEncApp)")" build/wasm/bin <work-dir>
 ```
 
 Set `CMAKE_OUTPUT_DIRECTORY` explicitly; otherwise upstream writes binaries
@@ -105,5 +116,5 @@ await jxs.terminate();
 ## Status / next steps
 
 See [plan.md](plan.md). Phases 0 (spike), 1 (build support in the fork,
-branch `wasm`) and 2 (C shim + TypeScript/Worker wrapper) are done; next is
-packaging and checks in Nix (Phase 3).
+branch `wasm`), 2 (C shim + TypeScript/Worker wrapper) and 3 (Nix package +
+checks) are done; next is performance (Phase 4).

@@ -1,10 +1,16 @@
 #!/usr/bin/env bash
-# Phase 0 spike: encode + decode synthetic frames with the native SVT apps
-# (SIMD and C-only) and the wasm build (under node), then compare outputs.
-# Usage: spike/compare.sh <wasm-build-dir> <work-dir>
+# Bit-exactness check of the wasm apps against the native reference apps.
+# Encodes synthetic frames with the native SVT apps (SIMD and --asm c) and the
+# wasm build (under node), decodes with native and wasm, and compares outputs.
+# Exits non-zero on any mismatch.
+#
+# Usage: scripts/compare-apps.sh <native-bin-dir> <wasm-bin-dir> <work-dir>
+#   <native-bin-dir>  contains SvtJpegxsEncApp / SvtJpegxsDecApp
+#   <wasm-bin-dir>    contains SvtJpegxsEncApp.js / SvtJpegxsDecApp.js (+ .wasm)
 set -euo pipefail
-WASM=$(realpath "$1")
-WORK=$2
+NATIVE=$(realpath "$1")
+WASM=$(realpath "$2")
+WORK=$3
 mkdir -p "$WORK"
 cd "$WORK"
 
@@ -32,30 +38,42 @@ with open(out, "wb") as f:
 EOF
 }
 
+native() { "$NATIVE/$1" "${@:2}"; }
 wasm() { node "$WASM/$1.js" "${@:2}"; }
+
+failures=0
+check() { # check <a> <b> <label>
+  if cmp -s "$1" "$2"; then
+    echo "   ok:       $3"
+  else
+    echo "   MISMATCH: $3"
+    failures=$((failures + 1))
+  fi
+}
 
 run_case() { # run_case <name> <w> <h> <fmt> <depth> <bpp> [extra enc args]
   local name=$1 w=$2 h=$3 fmt=$4 depth=$5 bpp=$6; shift 6
   echo "== $name: ${w}x${h} $fmt ${depth}bit bpp=$bpp $*"
   gen "$name.yuv" "$w" "$h" "$fmt" "$depth" 3
   local enc=(-w "$w" -h "$h" --colour-format "$fmt" --input-depth "$depth" --bpp "$bpp" -n 3 --no-progress 1 -v 0 "$@")
-  SvtJpegxsEncApp -i "$name.yuv" -b "$name.native.jxs" "${enc[@]}" >/dev/null
-  SvtJpegxsEncApp -i "$name.yuv" -b "$name.native-c.jxs" --asm c "${enc[@]}" >/dev/null
-  local t0=$(date +%s.%N)
+  native SvtJpegxsEncApp -i "$name.yuv" -b "$name.native.jxs" "${enc[@]}" >/dev/null
+  native SvtJpegxsEncApp -i "$name.yuv" -b "$name.native-c.jxs" --asm c "${enc[@]}" >/dev/null
   wasm SvtJpegxsEncApp -i "$name.yuv" -b "$name.wasm.jxs" "${enc[@]}" >/dev/null
-  local t1=$(date +%s.%N)
-  SvtJpegxsDecApp -i "$name.native.jxs" -o "$name.native.dec.yuv" -v 0 >/dev/null
-  local t2=$(date +%s.%N)
+  native SvtJpegxsDecApp -i "$name.native.jxs" -o "$name.native.dec.yuv" -v 0 >/dev/null
   wasm SvtJpegxsDecApp -i "$name.native.jxs" -o "$name.wasm.dec.yuv" -v 0 >/dev/null
-  local t3=$(date +%s.%N)
-  printf '   wasm enc %.2fs, wasm dec %.2fs\n' "$(echo "$t1 - $t0" | bc)" "$(echo "$t3 - $t2" | bc)"
-  md5sum "$name".*.jxs "$name".*.dec.yuv | sed 's/^/   /'
-  cmp -s "$name.native.jxs" "$name.wasm.jxs" && echo "   enc: wasm == native" || echo "   enc: MISMATCH"
-  cmp -s "$name.native.jxs" "$name.native-c.jxs" && echo "   enc: native C == native SIMD" || echo "   enc: native C != native SIMD"
-  cmp -s "$name.native.dec.yuv" "$name.wasm.dec.yuv" && echo "   dec: wasm == native" || echo "   dec: MISMATCH"
+  check "$name.native.jxs" "$name.native-c.jxs" "enc: native C == native SIMD"
+  check "$name.native.jxs" "$name.wasm.jxs" "enc: wasm == native"
+  check "$name.native.dec.yuv" "$name.wasm.dec.yuv" "dec: wasm == native"
 }
 
 run_case a 1920 1080 yuv420 8 3
 run_case b 1280 720 yuv422 10 4
 run_case c 640 480 yuv444 12 6 --coding-signs 2 --coding-vpred 1
 run_case d 1000 600 yuv422 10 2.5 --rc 3 --decomp_v 1 --decomp_h 3
+run_case e 1000 600 yuv422 10 3 --lp 8
+
+if [ "$failures" -ne 0 ]; then
+  echo "$failures comparison(s) failed"
+  exit 1
+fi
+echo "all comparisons passed"

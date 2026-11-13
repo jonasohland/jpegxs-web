@@ -1,7 +1,8 @@
 // Tests for the synchronous JxsCodec under node, run against the built dist/.
 // Encoder and decoder output is compared byte-for-byte with the native
 // reference apps (SvtJpegxsEncApp / SvtJpegxsDecApp) when they are on PATH
-// (they are in the dev shell).
+// (they are in the dev shell). Set JXS_REQUIRE_NATIVE=1 to make their absence
+// an error.
 import { after, before, describe, test } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
@@ -22,6 +23,10 @@ function hasNative(): boolean {
   }
 }
 const native = hasNative();
+// The Nix check sets this so a missing reference app fails instead of skipping.
+if (process.env.JXS_REQUIRE_NATIVE === "1" && !native) {
+  throw new Error("JXS_REQUIRE_NATIVE=1 but SvtJpegxsDecApp is not on PATH");
+}
 
 interface Case {
   name: string;

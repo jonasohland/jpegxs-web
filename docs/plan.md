@@ -58,7 +58,7 @@ In `github.com/jonasohland/SVT-JPEG-XS`:
 - Promise-based API running in a Worker; planes copied directly into and out
   of the wasm heap.
 
-### Phase 3 — Nix package + checks
+### Phase 3 — Nix package + checks — done, see results below
 
 - `packages.svt-jpegxs-wasm` built with emcmake.
 - `checks.*` run under node:
@@ -261,3 +261,44 @@ Open points carried into Phase 3:
   anyway.
 - `spike/CMakeLists.txt` and the patch are still in the tree (obsolete since
   Phase 1).
+
+## Phase 3 results (2026-11-13)
+
+**Done.** `nix flake check` builds all packages and runs two bit-exactness
+checks. Both pass.
+
+Packages:
+
+- `packages.jpegxs-web` (`nix/jpegxs-web.nix`): the npm package. It runs the
+  same steps as `npm run build` (emcmake + ninja on the root
+  `CMakeLists.txt`, then `tsc` from nixpkgs' TypeScript 7) on a fileset-filtered
+  source. `$out` is the package directory (`package.json` + `dist/`), so it
+  can be installed with `npm install <store path>`. It has no runtime
+  references to the store.
+- The emscripten cache/`EMCC_CFLAGS` setup is shared by both wasm derivations
+  through `nix/emscripten-env.nix`.
+
+Checks (`nix/checks.nix`; the packages themselves are also exposed as checks):
+
+- `svt-jpegxs-wasm-apps`: `scripts/compare-apps.sh` (formerly
+  `spike/compare.sh`). It encodes synthetic frames with the native apps (SIMD
+  and `--asm c`) and with the wasm apps under node, decodes with both, and
+  fails on any mismatch. The four Phase 0 cases are covered, plus case e
+  (`--lp 8`). The native C and SIMD encoders are confirmed bit-exact in all
+  cases.
+- `jpegxs-web-test`: `node --test` from `test/` against the packaged `dist/`,
+  with the native apps on PATH and `JXS_REQUIRE_NATIVE=1`. That makes missing
+  reference apps a failure instead of silently skipping the byte-for-byte
+  comparisons. All 13 tests pass in the sandbox.
+
+Cleanup: `spike/` (the obsolete CMakeLists and patch) is removed.
+
+Notes:
+
+- The flake's source includes the submodule. With a clean tree, Nix fetches
+  the submodule commit from the fork's remote (`.gitmodules`), so the
+  submodule commit must be pushed there. A dirty tree uses the local
+  checkout.
+- The `.js.map` files in `dist/` point at `../src/*.ts`, which the package
+  does not ship. The same is true of `npm pack` with `"files": ["dist"]`.
+- `test:browser` still needs Chrome and stays manual.
