@@ -300,5 +300,6 @@ Notes:
   submodule commit must be pushed there. A dirty tree uses the local
   checkout.
 - The `.js.map` files in `dist/` point at `../src/*.ts`, which the package
-  does not ship. The same is true of `npm pack` with `"files": ["dist"]`.
+  does not ship. `tsconfig.json` sets `inlineSources` so the maps carry the
+  TypeScript sources themselves (about 52 KB of maps in total).
 - `test:browser` still needs Chrome and stays manual.
