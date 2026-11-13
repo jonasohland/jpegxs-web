@@ -55,6 +55,7 @@
             ninja
             pkg-config
             nodejs
+            typescript
             binaryen
             wabt
             python3

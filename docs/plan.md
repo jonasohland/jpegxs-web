@@ -47,7 +47,7 @@ In `github.com/jonasohland/SVT-JPEG-XS`:
 - guard flags emcc doesn't support;
 - keep patches small so they rebase easily and could go upstream.
 
-### Phase 2 — JS-facing wrapper (this repo)
+### Phase 2 — JS-facing wrapper (this repo) — done, see results below
 
 - Thin C shim with plain exported functions (no embind) plus a hand-written
   TypeScript wrapper.
@@ -186,3 +186,78 @@ Verification:
 
 `spike/CMakeLists.txt` and the patch file are now obsolete. `spike/compare.sh`
 should move into a Nix check in Phase 3.
+
+## Phase 2 results (2026-11-13)
+
+**Done.** The C shim, the TypeScript wrapper and the Worker client are in
+place. The node build is bit-exact with the native apps, and the browser
+Worker path matches the node build.
+
+Layout (in this repo):
+
+- `CMakeLists.txt` (root): `add_subdirectory(third_party/SVT-JPEG-XS)` (library
+  only) plus the shim, linked to `dist/jxs.mjs` + `dist/jxs.wasm` as an ES6
+  module (`-sMODULARIZE -sEXPORT_ES6`, `ENVIRONMENT=web,worker,node`,
+  `FILESYSTEM=0`, memory growth up to 4 GB). The wasm is about 200 KB.
+- `csrc/jxs.c`: the shim. It passes only integers and pointers. It exposes
+  `jxs_probe` and handle-based `jxs_decoder_{open,decode,close}` /
+  `jxs_encoder_{config,open,encode,close}`. Image info goes back in a
+  `uint32_t[20]` array and encoder parameters go in as an `int32_t[17]` array
+  (-1 = library default). Planes always travel as one contiguous, tightly
+  packed buffer. `jxs_info_len` / `jxs_enc_params_len` / `jxs_api_version`
+  let the JS side detect an ABI mismatch.
+- `src/`:
+  - `abi.ts` mirrors the C constants;
+  - `codec.ts` holds `JxsCodec`, a synchronous codec for node or a Worker. It
+    keeps the last decoder and encoder open and reuses them while the stream
+    shape (checked with a probe, falling back on `DecoderConfigChange`) or the
+    encoder parameters stay the same. Reuse roughly halves the per-frame time
+    (1080p encode: 59 → 23 ms);
+  - `worker.ts` and `client.ts` hold `createJxsWorker()` /
+    `JxsWorkerClient`, which provide the Promise API with transferable
+    results;
+  - `index.ts` is the browser entry (client + types only); `jpegxs-web/codec`
+    is the sync codec.
+- bpp given as a number is converted the way EncApp does it (`2.5` → 25/10),
+  so codestreams match the reference CLI exactly.
+
+Threading:
+
+- The codec creates its pipeline threads synchronously in init and blocks on
+  them, so they must come from emscripten's pre-spawned pool.
+  `PTHREAD_POOL_SIZE` is the JS expression `Module['jxsThreadPoolSize']??8`.
+  `JxsCodec.create()` sets it to `2 * max(threads, 4)`, enough for one
+  decoder and one encoder open at once: the decoder uses `max(threads, 3)`
+  threads and the encoder at most `max(threads, 4)`.
+- `PTHREAD_POOL_SIZE_STRICT=2` turns pool exhaustion into an error instead
+  of a deadlock.
+- `threads` defaults to `min(hardwareConcurrency, 8)`.
+
+Tests:
+
+- `npm test` runs `test/codec.test.ts` with node's built-in type stripping
+  against `dist/`. It covers the four `spike/compare.sh` cases, proxy modes,
+  decoder reuse/reopen across shape and coding changes, planes vs contiguous
+  input, Uint16 planes, and error paths. When the native apps are on PATH
+  (dev shell), codestreams and decoded output are compared byte-for-byte with
+  `SvtJpegxsEncApp` / `SvtJpegxsDecApp`. All 13 tests pass.
+- `npm run test:browser` serves the repo with COOP/COEP
+  (`scripts/serve.mjs`) and runs `test/browser/index.html` in headless Chrome
+  through `createJxsWorker`. It checks that the page is cross-origin isolated
+  and that SHA-256 hashes of the codestreams and of the full- and
+  half-resolution decodes equal the node build's. It passes. Headless Chrome
+  timings: 1080p 4:2:0 decode about 54 ms, 720p 10-bit 4:2:2 encode 26 ms /
+  decode 28 ms.
+
+Open points carried into Phase 3:
+
+- `dist/` is a build output (gitignored). Build it with `npm run build`
+  (`build:wasm` + `build:ts`; `tsc` comes from the dev shell, TypeScript 7).
+  The Nix package should run both and the `checks` should run `npm test`;
+  `test:browser` needs Chrome and stays manual.
+- Only planar formats are tested. `packed-rgb` encoder input is passed
+  through but untested.
+- Strides are always tight. The decoder doesn't support padded strides
+  anyway.
+- `spike/CMakeLists.txt` and the patch are still in the tree (obsolete since
+  Phase 1).

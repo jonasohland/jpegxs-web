@@ -42,7 +42,7 @@ nix build .#jxs-cuda
 
 | Shell     | Contents |
 |-----------|----------|
-| `default` | emscripten, cmake, ninja, pkg-config, nodejs, binaryen, wabt, python3, and the native `svt-jpegxs` tools. |
+| `default` | emscripten, cmake, ninja, pkg-config, nodejs, typescript, binaryen, wabt, python3, and the native `svt-jpegxs` tools. |
 | `cuda`    | Everything in `default`, plus `jxs-cuda` (pulls in the CUDA toolkit). |
 
 ```sh
@@ -72,7 +72,38 @@ into `third_party/SVT-JPEG-XS/Bin/`.
 
 `nix fmt` runs `nixfmt`.
 
+## JS library
+
+| Path | Contents |
+|------|----------|
+| `CMakeLists.txt` | Builds `dist/jxs.mjs` + `dist/jxs.wasm` (emcmake) from the submodule and the shim. |
+| `csrc/jxs.c` | C shim with plain exported functions. |
+| `src/` | TypeScript: `JxsCodec` (sync, `jpegxs-web/codec`), Worker + `createJxsWorker()` (Promise API, main entry). |
+| `test/` | `codec.test.ts` (node, bit-exact vs native apps), `browser/` (headless Chrome). |
+| `scripts/serve.mjs` | Static server with COOP/COEP headers. |
+
+```sh
+npm run build          # emcmake/ninja into build/lib, then tsc into dist/
+npm test               # node tests (native comparisons need the dev shell)
+npm run test:browser   # headless Chrome (CHROME=... to override)
+npm run serve          # http://127.0.0.1:8080/ with cross-origin isolation
+```
+
+Browser usage (the page must send `Cross-Origin-Opener-Policy: same-origin`
+and `Cross-Origin-Embedder-Policy: require-corp`):
+
+```js
+import { createJxsWorker } from "jpegxs-web";
+const jxs = await createJxsWorker({ threads: 4 });
+const info = await jxs.probe(bytes);
+const { planes, data, width, height } = await jxs.decode(bytes, { proxy: "full" });
+const codestream = await jxs.encode(
+  { width, height, bitDepth: 10, format: "yuv422", planes }, { bpp: 3 });
+await jxs.terminate();
+```
+
 ## Status / next steps
 
-See [plan.md](plan.md). Phases 0 (spike) and 1 (build support in the fork,
-branch `wasm`) are done; next is the JS-facing wrapper (Phase 2).
+See [plan.md](plan.md). Phases 0 (spike), 1 (build support in the fork,
+branch `wasm`) and 2 (C shim + TypeScript/Worker wrapper) are done; next is
+packaging and checks in Nix (Phase 3).

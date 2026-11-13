@@ -1,0 +1,60 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>jpegxs-web browser test</title>
+<pre id="log"></pre>
+<script type="module">
+  import { createJxsWorker } from "/dist/index.js";
+  import { makeImage } from "/test/image.js";
+
+  const log = (s) => (document.getElementById("log").textContent += s + "\n");
+  const hex = async (bytes) =>
+    [...new Uint8Array(await crypto.subtle.digest("SHA-256", bytes))].map((b) => b.toString(16).padStart(2, "0")).join("");
+
+  async function run() {
+    const result = { crossOriginIsolated, cases: [] };
+    if (!crossOriginIsolated) throw new Error("page is not cross-origin isolated");
+    const jxs = await createJxsWorker({ threads: 4 });
+    for (const [w, h, format, depth, bpp] of [
+      [1920, 1080, "yuv420", 8, 3],
+      [1280, 720, "yuv422", 10, 2.5],
+    ]) {
+      const image = { width: w, height: h, bitDepth: depth, format, data: makeImage(w, h, format, depth) };
+      let t = performance.now();
+      const cs = await jxs.encode(image, { bpp, transfer: true });
+      const encodeMs = performance.now() - t;
+      const info = await jxs.probe(cs);
+      t = performance.now();
+      const decoded = await jxs.decode(cs);
+      const decodeMs = performance.now() - t;
+      const half = await jxs.decode(cs, { proxy: "half" });
+      const c = {
+        size: [w, h, format, depth, bpp],
+        probe: [info.width, info.height, info.format, info.bitDepth, info.frameSize],
+        codestream: await hex(cs),
+        decoded: await hex(decoded.data),
+        planeTypes: decoded.planes.map((p) => p.constructor.name),
+        half: [half.width, half.height, await hex(half.data)],
+        encodeMs: Math.round(encodeMs),
+        decodeMs: Math.round(decodeMs),
+      };
+      log(JSON.stringify(c));
+      result.cases.push(c);
+    }
+    try {
+      await jxs.decode(new Uint8Array(1000));
+      result.error = "no error thrown";
+    } catch (e) {
+      result.error = [e.name, e.code, e.message];
+    }
+    await jxs.terminate();
+    return result;
+  }
+
+  run()
+    .then((r) => ({ ok: true, ...r }))
+    .catch((e) => ({ ok: false, error: String(e?.stack ?? e) }))
+    .then((r) => {
+      log(JSON.stringify(r));
+      return fetch("/result", { method: "POST", body: JSON.stringify(r) });
+    });
+</script>

@@ -1,0 +1,27 @@
+{
+  "name": "jpegxs-web",
+  "version": "0.1.0",
+  "description": "JPEG XS encoder and decoder for the browser and node (SVT-JPEG-XS compiled to WebAssembly)",
+  "license": "BSD-2-Clause-Patent",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./codec": {
+      "types": "./dist/codec.d.ts",
+      "default": "./dist/codec.js"
+    },
+    "./worker": "./dist/worker.js"
+  },
+  "files": ["dist"],
+  "scripts": {
+    "build:wasm": "emcmake cmake -S . -B build/lib -G Ninja -DCMAKE_BUILD_TYPE=Release && ninja -C build/lib",
+    "build:ts": "tsc -p . && cp src/jxs.d.mts dist/",
+    "build": "npm run build:wasm && npm run build:ts",
+    "test": "node --test \"test/**/*.test.ts\"",
+    "test:browser": "node test/browser/run.mjs",
+    "serve": "node scripts/serve.mjs"
+  }
+}
