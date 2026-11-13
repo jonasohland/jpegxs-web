@@ -92,6 +92,7 @@ into `third_party/SVT-JPEG-XS/Bin/`.
 | `src/` | TypeScript: `JxsCodec` (sync, `jpegxs-web/codec`), Worker + `createJxsWorker()` (Promise API, main entry). |
 | `test/` | `codec.test.ts` (node, bit-exact vs native apps), `browser/` (headless Chrome). |
 | `scripts/serve.mjs` | Static server with COOP/COEP headers. |
+| `scripts/bench.mjs` | Encode/decode timing + output hashes for a dist directory. |
 
 ```sh
 npm run build          # emcmake/ninja into build/lib, then tsc into dist/
@@ -117,4 +118,7 @@ await jxs.terminate();
 
 See [plan.md](plan.md). Phases 0 (spike), 1 (build support in the fork,
 branch `wasm`), 2 (C shim + TypeScript/Worker wrapper) and 3 (Nix package +
-checks) are done; next is performance (Phase 4).
+checks) are done; Phase 4 (performance) is in progress: wasm SIMD
+auto-vectorization (`JXS_WASM_SIMD`) is on, the decoder is profiled and
+two submodule fixes (dequant, Liftoff worker loop) make it 2–2.6× faster;
+hand-written kernels are next. Benchmark: `node scripts/bench.mjs [dist-dir]`.

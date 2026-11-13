@@ -71,11 +71,11 @@ In `github.com/jonasohland/SVT-JPEG-XS`:
   now refuses `BUILD_TESTING` without `ENABLE_X86_ASM`. Rely on the
   end-to-end bit-exactness checks instead.
 
-### Phase 4 — Performance
+### Phase 4 — Performance — in progress, see results below
 
 Measured against the plain-C baseline:
 
-1. `-O3 -msimd128` + LTO.
+1. `-O3 -msimd128` + LTO. — done
 2. Try compiling the existing SSE2/SSE4.1 kernels via emscripten's SSE →
    wasm SIMD translation (AVX2/AVX-512 don't map well).
 3. Hand-written `wasm_simd128.h` kernels for profiled hotspots (likely
@@ -303,3 +303,146 @@ Notes:
   does not ship. `tsconfig.json` sets `inlineSources` so the maps carry the
   TypeScript sources themselves (about 52 KB of maps in total).
 - `test:browser` still needs Chrome and stays manual.
+
+## Phase 4 results (in progress)
+
+Focus: the decoder.
+
+### Benchmark
+
+`scripts/bench.mjs [dist-dir] [--threads 1,4] [--frames 30] [--cases ...]`
+runs `JxsCodec` under node on synthetic frames (`test/image.js`). It reports
+the median/min time per frame after warm-up and SHA-256 prefixes of the
+codestream and decoded output, so builds can be compared for speed and
+bit-exactness at once. To compare a variant, build it into its own directory
+(`emcmake cmake ... -DJXS_OUTPUT_DIR=<dir> -DCMAKE_C_FLAGS=...`) and copy the
+compiled TypeScript from `dist/` next to it.
+
+Measuring pitfalls:
+
+- **Power state.** On battery the laptop (Core Ultra 7 258V, 4 P + 4 LPE
+  cores) is up to 2× slower. Compare only runs made back to back on AC.
+- **One case per process.** V8 caches compiled wasm per module in-process, so
+  only the first codec of a process shows "cold" behavior (see the Liftoff
+  finding below). That first codec is what a real player uses. For decoder
+  numbers, run one `--threads`/`--cases` combination per node process.
+- `threads` is the SVT `threads_num`. The decoder runs `threads − 2`
+  universal (slice) threads, at least 1, plus an init and a final thread. So
+  `threads: 3` is one worker, and the tests' `threads: 4` is only two.
+
+### Step 1: compiler flags (2026-11-13) — done
+
+- `-O3` and `-flto` were already in place: upstream adds `-flto`, CMake's
+  Release flags give `-O3`, and the link step runs at `-O3` too.
+- `-fstack-protector-strong` (from upstream) has no effect on wasm: the binary
+  contains no `__stack_chk_*`, and `-fno-stack-protector` gives an identical
+  binary.
+- `-msimd128` (clang auto-vectorization) is bit-exact (all hashes unchanged).
+  It is now the root CMake option `JXS_WASM_SIMD` (default `ON`).
+  `nix/svt-jpegxs-wasm.nix` has a matching `simd` argument (default `true`),
+  so the `compare-apps` check covers the vectorized code. The wasm grows from
+  201 KB to 232 KB. Encoding gains about 30–40% (measured on battery, so only
+  indicative); decoding gains 7–20% (table below).
+
+### Decoder profile (2026-11-13)
+
+Tools: `node --cpu-prof` (it profiles the pthread workers too) on a build
+linked with `--profiling-funcs`; `perf record` + `node --perf-prof` +
+`perf inject --jit`, which also shows the V8 tier (Liftoff/TurboFan) per
+function; `perf` on the native `SvtJpegxsDecApp --asm c|max`. Note that
+`--cpu-prof` counts threads blocked in `Atomics.wait`
+(`emscripten_futex_wait`) as busy; exclude it.
+
+Where the single-thread decode time goes (1080p/2160p 4:2:2 10-bit, wasm,
+`-msimd128`, share of decoder CPU):
+
+| Part | wasm | native C | Functions |
+|------|------|----------|-----------|
+| Entropy decoding / unpacking | ~35% | ~23% | `vlc_reader_get_next_value`, `unpack_data_c`, `unpack_data_single_group`, `svt_jpeg_xs_decode_slice` |
+| Dequantization | ~25% | ~23% | `dequant_c` (deadzone) |
+| Inverse DWT + output scaling | ~25% | ~45% | `idwt_horizontal_line_*`, `idwt_vertical_line*`, `linear_output_scaling_16bit_line_c`, `transform_precinct*` |
+| Other (JS copy-out, log2, sign) | rest | rest | |
+
+LTO inlines most of the IDWT into `transform_precinct` /
+`new_transform_component_line` in the wasm build, so the wasm attribution is
+coarser. In the native AVX2 build, `unpack_data_avx2` (43%) and
+`svt_jpeg_xs_decode_slice` (23%) dominate: the entropy decoding is the hardest
+part to speed up.
+
+#### Finding 1: `dequant_c` doesn't vectorize
+
+`inv_quant_deadzone` indexes `gclis[coeff_idx / group_size]` with a runtime
+`group_size`, so neither clang for wasm nor gcc for x86 vectorizes it. It is
+always `GROUP_SIZE` (4) in practice (the SSE4.1 kernel asserts that).
+Dispatching to a call with the constant (`Dequant.c`, 5 lines) is bit-exact
+and saves 10–15% of single-thread decode time.
+
+#### Finding 2: the slice worker loop runs as unoptimized Liftoff code
+
+The biggest issue. `thread_universal_stage_kernel` is an endless loop that
+each worker thread enters once. LTO and binaryen inline
+`svt_jpeg_xs_decode_slice` (with the unpacking around it) into it. V8 starts
+every wasm function in its baseline compiler (Liftoff) and swaps in TurboFan
+code only on the next call; there is no on-stack replacement for wasm. So the
+workers of the first decoder in a process (or page) run that code as Liftoff
+forever. With several workers it gets much worse: 4 workers spend 8× as much
+CPU per frame in that function as one worker, while all other functions cost
+the same. Native C scales 3–3.3× from 1 to 4 workers; wasm scaled 1.9×, and
+`threads: 8` was slower than `threads: 6`. `node --no-liftoff` makes the
+problem disappear, which confirms the cause. A later decoder (for example
+after a stream shape change) was fast, because its workers start after
+tier-up. The browser (V8 too) is affected the same way.
+
+`__attribute__((noinline))` on `svt_jpeg_xs_decode_slice` doesn't help:
+binaryen's `wasm-opt -O3` inlines single-call-site functions regardless, and
+`BINARYEN_EXTRA_PASSES` run after `-O3`. The fix: call it through a `volatile`
+function pointer in `DecThreadSlice.c` (9 lines), which no inliner can see
+through. It is bit-exact.
+
+The same pattern (endless stage loops with inlined work) very likely affects
+the decoder's init/final stage threads (they do little work) and the encoder's
+stage threads. Not yet checked.
+
+#### Results
+
+Decode time per frame in ms on AC power. Each cell is a fresh node process
+(cold, like a real player), median of 40 frames. "native" is
+`SvtJpegxsDecApp --lp <threads>` on the same codestreams (app fps, includes
+I/O).
+
+| Case | threads | before `-msimd128` | `-msimd128` | + dequant | + Liftoff fix | native C | native AVX2/512 |
+|------|---------|-------------------|-------------|-----------|---------------|----------|-----------------|
+| 1080p 4:2:0 8-bit, bpp 3 | 3 | 26.8 | 25.0 | 21.6 | 22.3 | 17.6 | 6.8 |
+| | 6 | 14.1 | 11.9 | 10.6 | 7.8 | 5.5 | 2.3 |
+| | 8 | 16.4 | 14.2 | 13.0 | **5.4** | 5.0 | 1.7 |
+| 1080p 4:2:2 10-bit, bpp 4 | 3 | 38.5 | 35.7 | 31.5 | 30.0 | 26.0 | 10.0 |
+| | 6 | 19.7 | 16.8 | 17.0 | 11.2 | 7.8 | 3.2 |
+| | 8 | 21.6 | 18.0 | 19.3 | **8.5** | 7.3 | 2.5 |
+| 2160p 4:2:2 10-bit, bpp 3 | 3 | 116.7 | 105.0 | 88.8 | 87.9 | 75.7 | 29.0 |
+| | 6 | 62.3 | 52.9 | 50.9 | 33.3 | 25.1 | 10.2 |
+| | 8 | 79.8 | 62.7 | 60.3 | **25.8** | 22.1 | 9.0 |
+
+With both fixes, the wasm decoder at the default `threads: 8` is 2.1–2.6×
+faster than the current build and within 10–20% of native C. It is still 3×
+slower than native AVX2/AVX-512.
+
+Both fixes are uncommitted changes in the submodule (`Dequant.c`,
+`DecThreadSlice.c`). `npm test` (bit-exact vs native), `test:browser` and
+`nix flake check` pass with them.
+
+### Next steps (decoder)
+
+1. Commit the two fixes on the fork's `wasm` branch. Check the decoder's init
+   and final stage loops and the encoder's stage loops for the same Liftoff
+   problem.
+2. Hand-written wasm SIMD kernels (step 3), in the order of what native AVX2
+   gains: IDWT horizontal (`idwt_horizontal_line_lf16_hf16`, `_lf32_hf16`)
+   and `linear_output_scaling_16bit_line`, then `idwt_vertical_line*`,
+   `dequant` (the SSE4.1 version is a template), and `inv_sign`.
+   `unpack_data` (entropy decoding) is the largest remaining part, but even
+   AVX2 helps it less.
+3. Step 2 (SSE → wasm SIMD translation) isn't worth it: only `dequant` among
+   the decoder's kernels has an SSE version, and it is easy to write by hand.
+4. Smaller items: the main-thread copy of the decoded frame out of the wasm
+   heap (about 4.5 ms per 2160p frame) could be avoided by decoding into a
+   caller-provided buffer or handing out a view.
