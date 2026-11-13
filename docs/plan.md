@@ -508,16 +508,198 @@ Decode ms per frame, fresh process each, on AC:
 The wasm decoder now matches or beats native C (whose `dequant_c` doesn't
 vectorize). The remaining gap to native AVX2 is 2.5–3.7×.
 
+### Step 3b: single-thread decoder at 60 fps (2026-11-13)
+
+Goal: 1080p at 60 fps (16.7 ms/frame) with one decoding thread
+(`threads: 3`, i.e. one slice worker; the init and final threads do little).
+
+Profiling showed the decoder spent about 61% of the single-thread time in
+entropy decoding, roughly 2.5× slower than native C for the same code. The
+inverse DWT came next. Changes, all bit-exact (in the fork, uncommitted):
+
+1. **`Packing.c`: no indirect call per VLC symbol.**
+   `vlc_reader_get_next_value()` computed `32 - svt_log2_32(x)` through the
+   rtcd function pointer, i.e. an indirect call into the branchy
+   `log2_32_c()` on wasm (native x86 uses `Log2_32_ASM`). Now
+   `__builtin_clz(x) + 1` (`x` is known to be non-zero; MSVC keeps the old
+   path). −18 to −20%.
+2. **`Packing.c`: inlinable VLC fast path.** The rare refill branch is now
+   `vlc_reader_refill()` (`NOINLINE`). It takes and returns the reader by
+   value, so the caller's reader doesn't escape: in wasm, address-taken locals
+   live in linear memory. `vlc_reader_get_next_value()` is `FORCE_INLINE`. New
+   `FORCE_INLINE` / `NOINLINE` macros in `Definitions.h`. About −8%,
+   together with 4.
+3. **`Packing.c`: `unpack_data_single_group()`** walks the nibbles with a
+   local index and updates the reader once, instead of calling
+   `read_4_bits_align4()` per bit plane. Small gain (about 3%) for the C path;
+   superseded on wasm by 4.
+4. **`unpack_data_wasm_simd128`** (`ASM_WASM_SIMD128/UnPack_wasm_simd128.c`):
+   loads up to 16 nibbles of a group (the sign nibble too, with
+   `sign_flag == 0`), spreads them into byte lanes in reverse order with one
+   `i8x16.shuffle` and collects each coefficient's bits with
+   `i8x16.bitmask` + `i8x16.add` (shift left by one), 4 times. It uses the fast
+   path only if the 8-byte load stays inside the bitstream buffer, and handles
+   more than 16 nibbles (corrupt streams) with a scalar path. It keeps the C
+   version's per-group `precinct_bits_left` check and error behavior.
+5. **`idwt_horizontal_line_lf16_hf16` / `_lf32_hf16`**
+   (`ASM_WASM_SIMD128/Idwt_wasm_simd128.c`). The C loop reads back the even
+   output it just stored, which blocks auto-vectorization. The even outputs
+   only depend on the inputs, so a block computes 4 evens twice (offset by
+   one), derives 4 odds and interleaves them; the first and last outputs keep
+   the C code. −7 to −10%.
+
+Verification: `npm test` (14 tests, byte-for-byte vs native),
+`test:browser`, `nix flake check` (wasm SIMD and wasm `--asm c` vs native,
+cases a–g). Plus a fuzz run: 120 randomly corrupted codestreams (1080p 4:2:2
+10-bit and 4:2:0 8-bit, 37 of them hitting decoder errors) decode identically
+with the wasm SIMD kernels and with `--asm c`, including exit status.
+
+Decode ms per frame (fresh process, AC power):
+
+| Case | threads: 3 (1 worker) before | threads: 3 now | threads: 8 now | native C, 1 worker | native AVX2/512, 1 worker |
+|------|-----------------------------|----------------|----------------|--------------------|---------------------------|
+| 1080p 4:2:0 8-bit | 18.4 | **10.3–10.9** | 3.0 | 17.6 | 6.8 |
+| 1080p 4:2:2 10-bit | 24.3 | **14.5–15.2** | 4.4 | 26.0 | 10.0 |
+| 720p 4:4:4 12-bit | – | 17.5–18.6 | 4.8 | – | – |
+| 2160p 4:2:2 10-bit | 74.9 | 49.1 | 14.9 | 75.7 | 29.0 |
+
+**Target reached for 1080p 4:2:0 8-bit and 4:2:2 10-bit** (about 12% headroom
+for 4:2:2 10-bit). The single-thread wasm decoder is now 1.7× faster than
+native C. It is about 1.5× slower than native AVX2.
+
+Remaining profile (1080p 4:2:2 10-bit, one worker):
+
+| Part | Share |
+|------|-------|
+| `unpack_data_wasm_simd128` | 29% |
+| `svt_jpeg_xs_decode_slice` (GCLI/VLC decoding inlined) | 17% |
+| `transform_precinct` (inlined: output scaling/NLT, buffer handling) | 11% |
+| IDWT horizontal (SIMD) | 13% |
+| JS copy-out of the frame (`memmove`) | 5% |
+| `idwt_vertical_line_c` | 4% |
+| `dequant_wasm_simd128` | 3% |
+| `vlc_reader_refill` | 2.4% |
+
+### Step 3c: windowed unpack and output scaling (2026-11-13)
+
+Both bit-exact, in the fork, uncommitted:
+
+1. **`unpack_data_wasm_simd128`: one window for several groups.** The kernel
+   loads a 16-nibble window and decodes as many consecutive groups from it as
+   fit. Groups at or below `gtli` take no nibbles, so they come for free. The
+   window's 4 bitmasks go into one `i32x4`. Each group's 4 outputs are built
+   with vector shift/and/or, truncated to 16 bits with a byte shuffle and
+   written with one 64-bit store. Error handling (per-group
+   `precinct_bits_left` check, failing group zeroed, reader position) is
+   unchanged. Groups that don't fit a window (corrupt streams) and the end of
+   the buffer take the per-group path. About 4.5 → 3.5 ms/frame for this
+   function (1080p 4:2:2 10-bit, profiled).
+2. **`linear_output_scaling_{8,16}bit_line_wasm_simd128`**
+   (`ASM_WASM_SIMD128/NltDec_wasm_simd128.c`), the inverse NLT for
+   `Tnlt == 0`. C does the rounding shift in 64 bits; the kernel uses the
+   overflow-free 32-bit form `(v >> dz) + (((v & (2^dz - 1)) + round) >> dz)`,
+   clamps with `i32x4.min/max` and narrows with saturation (exact after the
+   clamp). Parameters that valid streams don't produce (`dzeta` outside 0..30,
+   `m < 0`, `m` above the output type) go to C, which truncates. It had been
+   inlined into `transform_precinct` (11% of the profile) and is now 3.9%.
+   The whole-frame variants `linear_output_scaling_{8,16}bit_wasm_simd128`
+   (used only on the colour-transform path, `Cpih != 0`) loop the line
+   kernel over the rows. **They are not covered by tests**: the SVT encoder
+   never writes `Cpih != 0`, so we have no such streams.
+
+Verification: `npm test`, `test:browser`, `nix flake check`, and a fuzz run of
+160 corrupted codestreams (44 hitting decoder errors) with identical output
+and exit status for wasm SIMD and wasm `--asm c`.
+
+Decode ms per frame (fresh process, AC power):
+
+| Case | threads | before (3b) | now |
+|------|---------|-------------|-----|
+| 1080p 4:2:0 8-bit | 3 (1 worker) | 9.8–10.9 | **8.8–10.1** |
+| | 8 | 2.8 | 2.5 |
+| 1080p 4:2:2 10-bit | 3 (1 worker) | 14.6–15.1 | **11.9–13.7** |
+| | 8 | 4.5 | 3.5 |
+| 720p 4:4:4 12-bit | 3 (1 worker) | 17.8–19.0 | 16.5–17.6 |
+| 2160p 4:2:2 10-bit | 3 (1 worker) | 50.1 | 40.1 |
+| | 8 | 15.2 | 13.4 |
+
+1080p 4:2:2 10-bit on one worker now has about 20% headroom on the 60 fps
+budget and is close to native AVX2 (10.0 ms).
+
+Remaining profile (1080p 4:2:2 10-bit, one worker, 12.8 ms profiled):
+`unpack_data_wasm_simd128` 27%, `svt_jpeg_xs_decode_slice` (GCLI/VLC
+decoding) 21%, IDWT horizontal 13%, `idwt_vertical_line_c` 4.4%, JS copy-out
+4.3%, output scaling 3.9%, dequant 3.9%, VLC refill 3%.
+
+### Step 3d: GCLI decoding (2026-11-13)
+
+A profile with `-O1` at link (so binaryen doesn't inline single-call-site
+functions; only for attribution) put GCLI decoding at 15% of single-thread
+time (about 2.1 ms/frame for 1080p 4:2:2 10-bit), almost all of it in
+`unpack_pred_zero_gclis_no_significance`, plus 3% in `vlc_reader_refill`.
+Each GCLI is a unary code, and the per-value `clz` → shift → `clz` chain is
+serial. Changes in `Packing.c` (generic C, so native builds get them too;
+uncommitted):
+
+1. **`vlc_reader_get_values()`**: decodes a run of values with a 256-entry
+   table over the next 8 register bits (`vlc_lut_values` / `_ends` /
+   `_count`, generated). An entry gives the codes that end in those bits:
+   values packed in 8 bytes, end positions in nibbles. `gtli` is added to all
+   8 bytes with a carry-free SWAR add, and they are written with one (merged)
+   8-byte store; bytes past the requested count are overwritten later by the
+   caller. If no code ends in the 8 bits, or fewer than 8 bytes may be
+   written, it calls `vlc_reader_get_next_value()`, which refills and reports
+   errors. The table only consumes real bits (bits past the end of the data
+   are zero and never end a code), so the result doesn't depend on refill
+   timing. Used by both "prediction from zero" paths (with and without
+   significance); vertical prediction still decodes per value.
+2. **Inline register loads**: `vlc_reader_get_values()` tops up the register
+   when it holds ≤ 32 bits and at least 64 bits of data are left (the same
+   load as `vlc_reader_refill()`'s main branch, now `vlc_reader_load()`).
+
+GCLI decoding dropped to about 1.3 ms/frame (−40%) after 1; 2 gave another
+3–8% overall.
+
+Verification: `npm test` (against the dev shell's native apps, which predate
+the change), `test:browser`, `nix flake check`. These kernels are in generic C,
+so comparing wasm SIMD with wasm `--asm c` doesn't test them. Instead,
+`JxsCodec` from the build before this step and from the new one decoded 900
+corrupted codestreams (1080p 4:2:2 10-bit, 4:2:0 8-bit, and 720p 4:4:4 12-bit
+with sign coding and vertical prediction; 319 decoder errors) with identical
+output or error code. The 210-stream SIMD-vs-C fuzz run also passes.
+
+Decode ms per frame (fresh process, AC power):
+
+| Case | threads | before (3c) | now |
+|------|---------|-------------|-----|
+| 1080p 4:2:0 8-bit | 3 (1 worker) | 9.0 | 7.9–8.8 |
+| | 8 | 2.5 | 2.5 |
+| 1080p 4:2:2 10-bit | 3 (1 worker) | 12.4 | **11.2–11.7** |
+| | 8 | 3.7 | 3.4 |
+| 720p 4:4:4 12-bit | 3 (1 worker) | 17.2 | 16.1 |
+| 2160p 4:2:2 10-bit | 3 (1 worker) | 40.6 | 36.3 |
+| | 8 | 13.2 | 12.1 |
+
+Remaining profile (1080p 4:2:2 10-bit, one worker, `-O1` attribution
+build): `unpack_data_wasm_simd128` 27%, GCLI decoding 10%, IDWT horizontal
+14%, output scaling 5%, `idwt_vertical_line_c` 4.3%, JS copy-out 4.3%,
+dequant 3.3%, VLC refill 2.5% (before the inline loads), precinct/slice
+bookkeeping about 4%.
+
 ### Next steps (decoder)
 
-1. Commit the kernel. Check the decoder's init and final stage loops and the
-   encoder's stage loops for the Liftoff problem.
-2. More wasm SIMD kernels, in the order of what native AVX2 gains: IDWT
-   horizontal (`idwt_horizontal_line_lf16_hf16`, `_lf32_hf16`) and
-   `linear_output_scaling_16bit_line`, then `idwt_vertical_line*` and
-   `inv_sign`. `unpack_data` (entropy decoding) is the largest remaining
-   part, but even AVX2 helps it less. Profile again first: dequant no longer
-   dominates.
-3. Smaller items: the main-thread copy of the decoded frame out of the wasm
-   heap (about 4.5 ms per 2160p frame) could be avoided by decoding into a
-   caller-provided buffer or handing out a view.
+1. Commit the kernels and the `Packing.c` changes. The `Packing.c` changes help
+   every target (the indirect `svt_log2_32` call is also in the native C
+   path); `FORCE_INLINE`/`NOINLINE` and the clz builtin are candidates for
+   upstream.
+2. Further single-thread headroom, roughly in order of payoff/effort:
+   - GCLI decoding with vertical prediction still decodes per value (the
+     table approach applies there too, with the `delta_m` mapping per value);
+   - `unpack_data`: the remaining cost is mostly per-group control flow; a
+     prefix sum over the group sizes could compute several groups' window
+     offsets at once;
+   - avoid the JS copy-out (decode into a caller-provided buffer or hand out
+     a view), about 4%;
+   - `idwt_vertical_line*` (check whether clang vectorized it).
+3. Check the decoder's init/final stage loops and the encoder's stage loops for
+   the Liftoff problem.
