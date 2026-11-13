@@ -117,8 +117,8 @@ await jxs.terminate();
 ## Status / next steps
 
 See [plan.md](plan.md). Phases 0 (spike), 1 (build support in the fork,
-branch `wasm`), 2 (C shim + TypeScript/Worker wrapper) and 3 (Nix package +
-checks) are done; Phase 4 (performance) is in progress: wasm SIMD
-auto-vectorization (`JXS_WASM_SIMD`) is on, the decoder is profiled and
-two submodule fixes (dequant, Liftoff worker loop) make it 2–2.6× faster;
-hand-written kernels are next. Benchmark: `node scripts/bench.mjs [dist-dir]`.
+branch `wasm`), 2 (C shim + TypeScript/Worker wrapper), 3 (Nix package +
+checks) and 4 (performance: wasm SIMD kernels and decoder fixes; 1080p
+decodes at 60 fps on one thread) are done. Next is Phase 5, a single-threaded
+fallback for pages that aren't cross-origin isolated. Benchmark:
+`node scripts/bench.mjs [dist-dir]`.
